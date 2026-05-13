@@ -1,0 +1,46 @@
+[package]
+name = "mod-signal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+readme = "README.md"
+license = "Apache-2.0"
+
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+description = "Unified OS signal handling for Rust. SIGTERM / SIGINT / SIGHUP / SIGPIPE and Windows equivalents through one API. Graceful shutdown orchestration with priority ordering, timeout enforcement, and hook chaining. Replaces the patchwork of ctrlc + signal-hook with a clean runtime-agnostic substrate."
+
+keywords = [
+    "signal",
+    "sigterm",
+    "shutdown",
+    "ctrlc",
+    "process"
+]
+
+categories = [
+    "os",
+    "concurrency"
+]
+
+documentation = "https://docs.rs/mod-signal"
+repository    = "https://github.com/jamesgober/mod-signal"
+homepage      = "https://github.com/jamesgober/mod-signal"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[features]
+default = ["std"]
+std = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
