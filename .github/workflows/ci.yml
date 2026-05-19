@@ -77,4 +77,38 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.75
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-features --verbose
+
+      # Regenerate Cargo.lock so transitive resolution starts from
+      # the current crates.io index. Then pin transitive deps that
+      # have raised their MSRV above ours.
+      - name: Delete existing Cargo.lock
+        run: rm -f Cargo.lock
+
+      - name: Regenerate Cargo.lock with MSRV
+        run: cargo generate-lockfile
+
+      # Cargo 1.75 lacks the MSRV-aware resolver (stabilized in 1.84),
+      # so newly published versions can break the regenerated lockfile.
+      # `async-lock 3.4.x` raised its MSRV to 1.85 in early 2026; it
+      # only appears when the `async-std` feature is enabled, which is
+      # excluded from MSRV coverage below, but we pin defensively in
+      # case the resolver pulls it in via another optional path.
+      # Drop these pins when MSRV is raised.
+      - name: Pin MSRV-incompatible transitive deps
+        run: |
+          cargo update -p async-lock@3.4.2 --precise 3.3.0 || true
+
+      # MSRV is validated against the minimum realistic feature set
+      # (the `tokio` default plus `ctrlc-fallback`). The `async-std`
+      # feature pulls in `async-lock`, `polling`, and `rustix` versions
+      # that have raised their MSRV beyond 1.75 and is excluded from
+      # MSRV coverage; consumers who need `async-std` should pin their
+      # own toolchain to a newer minor.
+      - name: Check MSRV compatibility (lib, no default features)
+        run: cargo check --lib --no-default-features --features "std"
+
+      - name: Check MSRV compatibility (lib, default features)
+        run: cargo check --lib
+
+      - name: Check MSRV compatibility (lib, default + ctrlc-fallback)
+        run: cargo check --lib --features "ctrlc-fallback"

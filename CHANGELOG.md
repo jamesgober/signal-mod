@@ -6,6 +6,27 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-19
+
+### Fixed
+
+- `MSRV (Rust 1.75)` CI job failed on the `v0.9.0` push because
+  `cargo build --all-features --verbose` pulled in
+  `async-lock 3.4.2`, which raised its MSRV to 1.85 in early 2026.
+  The job is reworked to follow the `proc-daemon` pattern: delete
+  `Cargo.lock`, regenerate, pin `async-lock@3.4.2 -> 3.3.0`
+  defensively, and validate three realistic feature sets
+  (`--no-default-features`, default, `default + ctrlc-fallback`)
+  via `cargo check --lib`. The `async-std` feature is excluded
+  from MSRV coverage; consumers who need `async-std` should pin
+  their own toolchain to a newer minor. See the comment block in
+  `.github/workflows/ci.yml` for the full rationale.
+
+### Changed
+
+- Crate version bumped from `0.9.0` to `0.9.1`. No source under
+  `src/` changed; this is a CI-only patch.
+
 ## [0.9.0] - 2026-05-19
 
 ### Added
@@ -111,7 +132,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/mod-signal/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/mod-signal/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/jamesgober/mod-signal/releases/tag/v0.9.1
 [0.9.0]: https://github.com/jamesgober/mod-signal/releases/tag/v0.9.0
 [0.4.0]: https://github.com/jamesgober/mod-signal/releases/tag/v0.4.0
 [0.3.0]: https://github.com/jamesgober/mod-signal/releases/tag/v0.3.0
