@@ -1,6 +1,6 @@
 [package]
 name = "mod-signal"
-version = "0.1.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -30,17 +30,68 @@ repository    = "https://github.com/jamesgober/mod-signal"
 homepage      = "https://github.com/jamesgober/mod-signal"
 
 [package.metadata.docs.rs]
-all-features = true
+# Build with tokio + ctrlc-fallback. Excluding `async-std` because
+# its transitive `rustix 0.37.x` uses internal `rustc_*` attributes
+# that current nightly rejects, which would break docs.rs (this is
+# the same root cause as the `proc-daemon` v1.1.1 docs.rs patch).
+features = ["std", "tokio", "ctrlc-fallback"]
+default-target = "x86_64-unknown-linux-gnu"
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lib]
+name = "mod_signal"
+path = "src/lib.rs"
+
 [dependencies]
+parking_lot = "0.12"
+
+# Optional async runtimes. Exactly one is expected at a time; if
+# both are enabled, `tokio` wins (matches `proc-daemon`).
+tokio = { version = "1.40", default-features = false, features = [
+    "sync",
+    "signal",
+    "rt",
+    "time",
+    "macros",
+], optional = true }
+
+async-std = { version = "1.12", optional = true }
+futures = { version = "0.3", optional = true }
+
+# Synchronous Ctrl+C fallback when no async runtime is selected.
+ctrlc = { version = "3.4", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = { version = "0.3", optional = true }
+signal-hook-async-std = { version = "0.2", optional = true }
 
 [dev-dependencies]
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time", "sync"] }
+criterion = { version = "0.5", default-features = false }
+proptest = "1"
 
 [features]
-default = ["std"]
+default = ["std", "tokio"]
+
 std = []
+
+tokio = ["dep:tokio"]
+async-std = [
+    "dep:async-std",
+    "dep:futures",
+    "dep:signal-hook",
+    "dep:signal-hook-async-std",
+    "dep:ctrlc",
+]
+ctrlc-fallback = ["dep:ctrlc"]
+
+[[bench]]
+name = "shutdown_bench"
+harness = false
 
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[profile.bench]
+debug = true
