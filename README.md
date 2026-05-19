@@ -1,27 +1,20 @@
 <h1 align="center">
-    <strong>mod-signal</strong>
+    <strong>signal-mod</strong>
     <br>
     <sup><sub>CROSS-PLATFORM OS SIGNAL HANDLING FOR RUST</sub></sup>
 </h1>
 
 <p align="center">
-    <a href="https://crates.io/crates/mod-signal"><img alt="crates.io" src="https://img.shields.io/crates/v/mod-signal.svg"></a>
-    <a href="https://crates.io/crates/mod-signal"><img alt="downloads" src="https://img.shields.io/crates/d/mod-signal.svg"></a>
-    <a href="https://docs.rs/mod-signal"><img alt="docs.rs" src="https://docs.rs/mod-signal/badge.svg"></a>
-    <a href="https://github.com/jamesgober/mod-signal/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jamesgober/mod-signal/actions/workflows/ci.yml/badge.svg"></a>
+    <a href="https://crates.io/crates/signal-mod"><img alt="crates.io" src="https://img.shields.io/crates/v/signal-mod.svg"></a>
+    <a href="https://crates.io/crates/signal-mod"><img alt="downloads" src="https://img.shields.io/crates/d/signal-mod.svg"></a>
+    <a href="https://docs.rs/signal-mod"><img alt="docs.rs" src="https://docs.rs/signal-mod/badge.svg"></a>
+    <a href="https://github.com/jamesgober/signal-mod/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jamesgober/signal-mod/actions/workflows/ci.yml/badge.svg"></a>
 </p>
 
 <p align="center">
     One API for SIGTERM / SIGINT / SIGHUP and Windows equivalents, with priority-ordered graceful shutdown hooks.
 </p>
 
----
-
-## Status
-
-ACTIVE - pre-1.0 stabilization. Current release: `0.9.x`. API
-freeze begins at `1.0.0-rc.1`. See `.dev/ROADMAP.md` for the path
-to `1.0`.
 
 ## What it does
 
@@ -42,15 +35,15 @@ Unified OS signal handling for Rust:
 ## Quick start
 
 ```rust
-use mod_signal::{Coordinator, ShutdownReason, SignalSet};
+use signal_mod::{Coordinator, ShutdownReason, SignalSet};
 use std::time::Duration;
 
 #[tokio::main]
-async fn main() -> mod_signal::Result<()> {
+async fn main() -> signal_mod::Result<()> {
     let coord = Coordinator::builder()
         .signals(SignalSet::graceful())
         .graceful_timeout(Duration::from_secs(5))
-        .hook(mod_signal::hook_from_fn(
+        .hook(signal_mod::hook_from_fn(
             "flush-logs",
             100,
             |reason| eprintln!("shutting down: {reason}"),
@@ -94,4 +87,12 @@ Rust 1.75. Bumps require a minor version increment and a
 Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE)
 for the full text.
 
-Copyright (C) 2026 James Gober.
+
+<br>
+
+<!-- COPYRIGHT
+############################################# -->
+<div align="center">
+  <h2></h2>
+  <sup>COPYRIGHT <small>&copy;</small> 2026 <strong>JAMES GOBER.</strong></sup>
+</div>
