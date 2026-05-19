@@ -1,6 +1,6 @@
 //! Unified OS signal handling for Rust.
 //!
-//! `mod-signal` is a runtime-agnostic substrate for cross-platform
+//! `signal-mod` is a runtime-agnostic substrate for cross-platform
 //! signal handling and graceful shutdown orchestration. It provides:
 //!
 //! - A platform-neutral [`Signal`] enum covering SIGTERM, SIGINT,
@@ -18,16 +18,16 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use mod_signal::{Coordinator, ShutdownReason, SignalSet};
+//! use signal_mod::{Coordinator, ShutdownReason, SignalSet};
 //! use std::time::Duration;
 //!
 //! # #[cfg(feature = "tokio")]
 //! #[tokio::main]
-//! async fn main() -> mod_signal::Result<()> {
+//! async fn main() -> signal_mod::Result<()> {
 //!     let coord = Coordinator::builder()
 //!         .signals(SignalSet::graceful())
 //!         .graceful_timeout(Duration::from_secs(5))
-//!         .hook(mod_signal::hook_from_fn(
+//!         .hook(signal_mod::hook_from_fn(
 //!             "flush-logs",
 //!             100,
 //!             |reason| eprintln!("shutting down: {reason}"),
@@ -49,7 +49,7 @@
 //!
 //! See `.dev/DESIGN.md` and `REPS.md` for the design contract.
 
-#![doc(html_root_url = "https://docs.rs/mod-signal")]
+#![doc(html_root_url = "https://docs.rs/signal-mod")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -57,6 +57,7 @@
 mod coord;
 mod error;
 mod hook;
+mod install;
 mod reason;
 mod signal;
 mod state;

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mod_signal::{hook_from_fn, Coordinator, ShutdownReason, Signal, SignalSet};
+use signal_mod::{hook_from_fn, Coordinator, ShutdownReason, Signal, SignalSet};
 
 #[test]
 fn token_clones_share_state() {
@@ -108,7 +108,7 @@ fn install_without_runtime_returns_no_runtime() {
     {
         let coord = Coordinator::builder().build();
         let err = coord.install().unwrap_err();
-        assert!(matches!(err, mod_signal::Error::NoRuntime));
+        assert!(matches!(err, signal_mod::Error::NoRuntime));
     }
 }
 

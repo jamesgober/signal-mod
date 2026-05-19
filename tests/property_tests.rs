@@ -1,4 +1,4 @@
-//! Property tests for `mod-signal`.
+//! Property tests for `signal-mod`.
 //!
 //! These tests exercise algebraic properties of the public surface
 //! rather than specific example inputs. They are the primary
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use proptest::collection::vec;
 use proptest::prelude::*;
 
-use mod_signal::{hook_from_fn, Coordinator, ShutdownReason, Signal, SignalSet};
+use signal_mod::{hook_from_fn, Coordinator, ShutdownReason, Signal, SignalSet};
 
 fn any_signal() -> impl Strategy<Value = Signal> {
     prop_oneof![

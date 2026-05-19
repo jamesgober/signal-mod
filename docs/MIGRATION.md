@@ -1,120 +1,150 @@
-# mod-signal - Migration Guide
+# signal-mod - Migration Guide
 
-> Upgrade paths between `0.x.y` versions, and a forward-looking note
-> on the `1.0` API freeze.
+This guide covers the upgrade path **to** `signal-mod 1.0.0` and
+the policy that governs upgrades **within** the `1.x` line. For the
+authoritative API reference see [`API.md`](API.md); for the design
+contract see [`../REPS.md`](../REPS.md).
 
 ## Table of contents
 
-- [From `0.2.0` or earlier (design-only)](#from-020-or-earlier-design-only)
-- [From `0.3.0` to `0.4.0`](#from-030-to-040)
-- [From `0.4.0` to `0.9.0`](#from-040-to-090)
-- [Forward-looking: `0.9.x` -> `1.0.0`](#forward-looking-09x---100)
+- [Adopting `signal-mod 1.0.0`](#adopting-signal-mod-100)
+- [Upgrading within the `1.x` line](#upgrading-within-the-1x-line)
 - [Coexisting with `ctrlc` and `signal-hook`](#coexisting-with-ctrlc-and-signal-hook)
-- [Coexisting with `proc-daemon`](#coexisting-with-proc-daemon)
+- [Coexisting with daemon frameworks](#coexisting-with-daemon-frameworks)
+- [The `2.0` plan](#the-20-plan)
 
-## From `0.2.0` or earlier (design-only)
+## Adopting `signal-mod 1.0.0`
 
-`0.1.0` reserved the crate name; `0.2.0` published the design lock.
-Neither shipped a functional `src/` body. There is nothing to
-migrate from in your code base. Add the dep at the current minor:
+Add the dependency:
 
 ```toml
 [dependencies]
-mod-signal = "0.9"
+signal-mod = "1.0"
 ```
 
-Start from the Quick Start in the crate root rustdoc, or
-`examples/graceful_shutdown.rs`.
+Default features (`std + tokio`) cover the most common path. To
+swap runtimes:
 
-## From `0.3.0` to `0.4.0`
+```toml
+# async-std
+signal-mod = { version = "1.0", default-features = false, features = ["std", "async-std"] }
 
-No public API change. `cargo update -p mod-signal` is sufficient.
-
-Optional: rerun the bench suite on your hardware to populate
-your own performance baseline:
-
-```bash
-cargo bench --bench shutdown_bench
+# Synchronous Ctrl+C only, no async runtime
+signal-mod = { version = "1.0", default-features = false, features = ["std", "ctrlc-fallback"] }
 ```
 
-## From `0.4.0` to `0.9.0`
+Then follow the Quick Start in the [crate root rustdoc][docs-root]
+or [`examples/graceful_shutdown.rs`](../examples/graceful_shutdown.rs).
 
-No public API change. `cargo update -p mod-signal` is sufficient.
+[docs-root]: https://docs.rs/signal-mod/latest/signal_mod/
 
-New in `0.9.0`:
+### From a custom `ctrlc` + `signal-hook` setup
 
-- `tests/property_tests.rs` (proptest) is part of the in-tree test
-  suite. Downstream consumers do not pay for `proptest` in their
-  builds; it is dev-only.
-- `docs/MIGRATION.md` (this file).
-- `cargo-semver-checks` recommendation in the CI documentation;
-  see `.github/workflows/ci.yml` for the actual wiring.
+Replace the custom dispatcher with a `Coordinator`. The typical
+mechanical changes:
 
-If you wrote your own custom property-style tests against
-`SignalSet`'s algebraic identities, the bundled `tests/property_tests.rs`
-now covers them. Yours can be retired or kept as a regression
-backstop.
+| Before                                                  | After                                                                |
+| ------------------------------------------------------- | -------------------------------------------------------------------- |
+| `ctrlc::set_handler(\|\| { /* set flag */ })`           | `let coord = Coordinator::builder().build(); coord.install()?;`      |
+| Polling a custom shutdown flag                          | `coord.token().wait().await` / `wait_blocking()`                     |
+| A `Vec<Box<dyn Fn()>>` cleanup list iterated by hand    | `coord.run_hooks(reason)` with `ShutdownHook` impls                  |
+| Hand-rolled priority sort                               | `ShutdownHook::priority` (descending; ties preserve insertion order) |
+| Catching panics around cleanup callbacks                | Built in: `run_hooks` is panic-safe per hook                         |
 
-## Forward-looking: `0.9.x` -> `1.0.0`
+### From `tokio::signal::ctrl_c().await`
 
-The `0.9.x` line is the API freeze prep window. The `1.0.0` plan:
+`tokio::signal::ctrl_c` only covers SIGINT / Ctrl+C. `signal-mod`'s
+default `SignalSet::graceful()` additionally covers SIGTERM and
+SIGHUP (and the Windows `CTRL_CLOSE_EVENT` / `CTRL_SHUTDOWN_EVENT`),
+which is what most services actually want.
 
-1. **`1.0.0-rc.1`** ships once `cargo-semver-checks` reports no
-   breaking change versus the latest `0.9.x` release.
-2. A 14-day soak period; bugfixes only.
-3. **`1.0.0`** locks the surface. After `1.0.0`, any item exported
-   from the crate root is covered by semver.
+Replacement:
 
-If you are pinning today, prefer `mod-signal = "0.9"` over
-`"0.9.0"` so patch fixes flow in.
+```rust,no_run
+use signal_mod::{Coordinator, ShutdownReason};
 
-Things that may still change between `0.9.0` and `1.0.0-rc.1`:
+# #[cfg(feature = "tokio")]
+# #[tokio::main]
+# async fn main() -> signal_mod::Result<()> {
+let coord = Coordinator::builder().build();
+coord.install()?;
 
-- The `Error` enum is `#[non_exhaustive]`; new variants may be
-  added in `0.9.x` patches (not in `1.0.x`).
-- Internal modules (`state`) are private and may be reshaped.
-- `docs.rs` metadata may add additional features as needs surface.
+let token = coord.token();
+token.wait().await;
 
-Things that will **not** change:
+let _reason = token.reason().unwrap_or(ShutdownReason::Requested);
+# Ok(())
+# }
+```
 
-- The names, kinds, and signatures of the public items listed in
-  [`docs/API.md`](API.md).
-- The `parking_lot` runtime dependency (it stays mandatory).
-- MSRV `1.75`. A bump requires a minor version increment and a
-  `CHANGELOG` `### Changed` entry per `REPS.md` section 6.
+## Upgrading within the `1.x` line
+
+The `1.x` line follows [Semantic Versioning]. `cargo update -p signal-mod`
+is sufficient for any patch (`1.x.y`) or minor (`1.x.0`) upgrade.
+
+[Semantic Versioning]: https://semver.org/spec/v2.0.0.html
+
+The contract is documented in [`../REPS.md`](../REPS.md) section 8;
+in summary:
+
+- **Patch (`1.x.y`)** - bug fixes, doc improvements, dep bumps in
+  semver-compatible ranges, CI changes. No public surface change.
+- **Minor (`1.x.0`)** - additions to the public surface, new opt-in
+  features, internal perf work. MSRV bumps allowed.
+- **Major (`2.0.0`)** - anything that removes, renames, or changes
+  the signature of a public symbol, retires a feature flag, or adds
+  a non-opt-in runtime dependency.
+
+The `Error` enum is `#[non_exhaustive]`. New variants may land in
+`1.x.0`; downstream `match` arms must include a wildcard.
 
 ## Coexisting with `ctrlc` and `signal-hook`
 
-`mod-signal` sits at the layer above `ctrlc` and `signal-hook`. If
+`signal-mod` sits at the layer above `ctrlc` and `signal-hook`. If
 your application already depends on one of them, you can:
 
-- **Keep your existing `ctrlc` handler** and wire its callback to
+- **Keep an existing `ctrlc` handler** and wire its callback to
   call `ShutdownTrigger::trigger`. Do not also call
   `Coordinator::install` in this configuration; the two would
   contend for the same OS slot.
-- **Keep your existing `signal-hook` `SignalsInfo`** and forward
+- **Keep an existing `signal-hook::iterator::Signals`** and forward
   each signal to `ShutdownTrigger::trigger(ShutdownReason::Signal(...))`.
-  Same caveat: don't double-install.
+  Same caveat: do not double-install.
 
 The cleanest path is to retire the direct dependency once you
-migrate fully to `mod-signal`. The `signal-hook` Unix code is
-already pulled in transitively through the `async-std` feature, so
-you do not save a dep by keeping your own copy.
+migrate fully to `signal-mod`. `signal-hook` is pulled in
+transitively through the `async-std` feature, so you do not save a
+dep by keeping your own copy.
 
-## Coexisting with `proc-daemon`
+## Coexisting with daemon frameworks
 
-`proc-daemon` is being refactored (in its own v2 line) to consume
-`mod-signal` as a substrate. Until that lands:
+If you embed `signal-mod` inside a larger daemon framework, pick
+exactly one signal-handler owner:
 
-- A `proc-daemon` application can hold a `mod_signal::Coordinator`
-  alongside its `proc_daemon::Daemon`. Wire `mod_signal::ShutdownTrigger`
-  to `proc_daemon::ShutdownCoordinator::initiate_shutdown` if you want
-  the two to share state.
-- Do **not** let both crates install handlers for the same signal
-  in the same process. Pick one: either `proc-daemon` owns signal
-  installation (default), or `mod-signal` does (call
-  `Coordinator::install` and disable `proc-daemon`'s signal
-  handling via its `SignalConfig`).
+- **Framework owns signals** - configure the framework as usual.
+  Build the `signal-mod` `Coordinator` with `SignalSet::empty()`
+  and forward signals from the framework's own handler by calling
+  `ShutdownTrigger::trigger(ShutdownReason::Signal(...))`.
+- **`signal-mod` owns signals** - configure the framework to skip
+  its own signal install (most frameworks expose a flag for this),
+  then call `coord.install()` on the `signal-mod` coordinator.
 
-Once `proc-daemon` v2 ships, it will install via `mod-signal`
-internally and this section will be retired.
+Process-global signal slots are first-come-first-served. Two
+handlers in the same process do not compose.
+
+## The `2.0` plan
+
+There is no `2.0` plan as of the `1.0.0` tag. Breaking-change ideas
+that surface in the wild will be collected and considered for a
+future `2.0`. Until then, `1.x` is the stable line.
+
+Items that are explicitly out of scope for the `1.x` line and
+deferred to a hypothetical `2.0`:
+
+- An `async fn` `ShutdownHook::run` (would force a runtime choice
+  into the trait).
+- Per-thread signal masks (the current contract is process-global).
+- `no_std` core (the implementation needs `Mutex`, `Condvar`,
+  `Instant`, and the signal back-ends).
+
+If you have a concrete need for any of these, file an issue.

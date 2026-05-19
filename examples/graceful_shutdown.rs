@@ -13,11 +13,11 @@
 use std::time::Duration;
 
 #[cfg(feature = "tokio")]
-use mod_signal::{hook_from_fn, Coordinator, ShutdownReason, SignalSet};
+use signal_mod::{hook_from_fn, Coordinator, ShutdownReason, SignalSet};
 
 #[cfg(feature = "tokio")]
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> mod_signal::Result<()> {
+async fn main() -> signal_mod::Result<()> {
     let coord = Coordinator::builder()
         .signals(SignalSet::graceful())
         .graceful_timeout(Duration::from_secs(2))

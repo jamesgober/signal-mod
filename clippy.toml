@@ -1,3 +1,3 @@
-# clippy configuration for mod-signal
+# clippy configuration for signal-mod
 avoid-breaking-exported-api = true
 msrv = "1.75"

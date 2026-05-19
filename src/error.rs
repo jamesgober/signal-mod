@@ -5,7 +5,7 @@ use std::io;
 
 use crate::signal::Signal;
 
-/// Errors produced by `mod-signal` operations.
+/// Errors produced by `signal-mod` operations.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
@@ -64,5 +64,5 @@ impl std::error::Error for Error {
     }
 }
 
-/// Convenience alias for `Result<T, mod_signal::Error>`.
+/// Convenience alias for `Result<T, signal_mod::Error>`.
 pub type Result<T> = core::result::Result<T, Error>;

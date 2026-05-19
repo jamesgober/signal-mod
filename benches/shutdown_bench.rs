@@ -1,4 +1,4 @@
-//! Realistic micro-benchmarks for the `mod-signal` hot paths.
+//! Realistic micro-benchmarks for the `signal-mod` hot paths.
 //!
 //! Run with:
 //!
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-use mod_signal::{hook_from_fn, Coordinator, ShutdownReason, Signal, SignalSet};
+use signal_mod::{hook_from_fn, Coordinator, ShutdownReason, Signal, SignalSet};
 
 fn bench_token_is_initiated(c: &mut Criterion) {
     let coord = Coordinator::builder().build();

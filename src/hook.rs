@@ -73,7 +73,7 @@ where
 /// # Example
 ///
 /// ```
-/// use mod_signal::{hook_from_fn, ShutdownHook};
+/// use signal_mod::{hook_from_fn, ShutdownHook};
 ///
 /// let hook = hook_from_fn("flush-logs", 100, |reason| {
 ///     eprintln!("shutting down: {reason}");

@@ -1,6 +1,6 @@
-# mod-signal - Documentation
+# signal-mod - Documentation
 
-Reference documentation for the `mod-signal` crate.
+Reference documentation for the `signal-mod` crate.
 
 ## Sections
 

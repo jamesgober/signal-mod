@@ -1,6 +1,6 @@
 [package]
-name = "mod-signal"
-version = "0.9.1"
+name = "signal-mod"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -10,43 +10,55 @@ authors = [
     "James Gober <me@jamesgober.com>"
 ]
 
-description = "Unified OS signal handling for Rust. SIGTERM / SIGINT / SIGHUP / SIGPIPE and Windows equivalents through one API. Graceful shutdown orchestration with priority ordering, timeout enforcement, and hook chaining. Replaces the patchwork of ctrlc + signal-hook with a clean runtime-agnostic substrate."
+description = "Cross-platform OS signal handling and graceful-shutdown orchestration for Rust. One API for SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGPIPE, SIGUSR1, SIGUSR2 and the Windows console control events, with cloneable observer and initiator handles, priority-ordered shutdown hooks, and optional adapters for the Tokio and async-std runtimes."
 
+# crates.io enforces 5 keywords max, each up to 20 chars, alphanumeric
+# plus `-` / `_`. Optimized for search intent: signal handling,
+# graceful shutdown, ctrlc replacement.
 keywords = [
     "signal",
     "sigterm",
     "shutdown",
-    "ctrlc",
-    "process"
+    "graceful",
+    "ctrlc"
 ]
 
+# crates.io enforces 5 categories max from its taxonomy.
+# `os` is the umbrella; the `unix-apis` / `windows-apis` subcategories
+# cover the platform back-ends; `asynchronous` covers the runtime
+# adapters; `concurrency` covers the observer/initiator state machine.
 categories = [
     "os",
+    "os::unix-apis",
+    "os::windows-apis",
+    "asynchronous",
     "concurrency"
 ]
 
-documentation = "https://docs.rs/mod-signal"
-repository    = "https://github.com/jamesgober/mod-signal"
-homepage      = "https://github.com/jamesgober/mod-signal"
+documentation = "https://docs.rs/signal-mod"
+repository    = "https://github.com/jamesgober/signal-mod"
+homepage      = "https://github.com/jamesgober/signal-mod"
 
 [package.metadata.docs.rs]
-# Build with tokio + ctrlc-fallback. Excluding `async-std` because
-# its transitive `rustix 0.37.x` uses internal `rustc_*` attributes
-# that current nightly rejects, which would break docs.rs (this is
-# the same root cause as the `proc-daemon` v1.1.1 docs.rs patch).
+# Build with the realistic feature set: std + tokio + ctrlc-fallback.
+# The `async-std` feature is excluded because its transitive
+# `rustix 0.37.x` uses internal `rustc_*` attributes that current
+# docs.rs nightly rejects (same root cause as the `proc-daemon`
+# v1.1.1 docs.rs patch). Users who need `async-std` continue to
+# build it locally with `--features async-std`.
 features = ["std", "tokio", "ctrlc-fallback"]
 default-target = "x86_64-unknown-linux-gnu"
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
-name = "mod_signal"
+name = "signal_mod"
 path = "src/lib.rs"
 
 [dependencies]
 parking_lot = "0.12"
 
 # Optional async runtimes. Exactly one is expected at a time; if
-# both are enabled, `tokio` wins (matches `proc-daemon`).
+# both are enabled, `tokio` wins.
 tokio = { version = "1.40", default-features = false, features = [
     "sync",
     "signal",
@@ -73,9 +85,17 @@ proptest = "1"
 [features]
 default = ["std", "tokio"]
 
+# `std` is always on in practice. It exists as a feature so a future
+# `no_std` story can be carved out without a breaking change.
 std = []
 
+# Tokio runtime adapter. Installs signal listeners on the active
+# Tokio runtime; enables `ShutdownToken::wait().await`.
 tokio = ["dep:tokio"]
+
+# async-std runtime adapter. Uses `signal-hook-async-std` on Unix and
+# `ctrlc` as the Windows back-end (async-std lacks a native Windows
+# signal stream).
 async-std = [
     "dep:async-std",
     "dep:futures",
@@ -83,6 +103,10 @@ async-std = [
     "dep:signal-hook-async-std",
     "dep:ctrlc",
 ]
+
+# Synchronous `ctrlc` fallback. Lets `Coordinator::install` register a
+# handler when no async runtime feature is enabled (covers
+# `Signal::Interrupt`).
 ctrlc-fallback = ["dep:ctrlc"]
 
 [[bench]]

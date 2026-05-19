@@ -1,13 +1,13 @@
-# mod-signal - Project Specification (REPS)
+# signal-mod - Project Specification (REPS)
 
 > Authoritative specification for the public API surface and design
-> contract of `mod-signal`.
+> contract of `signal-mod`.
 
 ## 1. Identity
 
-- **Crate name:** `mod-signal`
+- **Crate name:** `signal-mod`
 - **Author:** James Gober <me@jamesgober.com>
-- **Repository:** https://github.com/jamesgober/mod-signal
+- **Repository:** https://github.com/jamesgober/signal-mod
 - **License:** Apache-2.0
 - **MSRV:** 1.75
 
@@ -21,7 +21,7 @@ clean runtime-agnostic substrate.
 
 ## 3. Scope
 
-`mod-signal` provides:
+`signal-mod` provides:
 
 1. A cross-platform `Signal` enum that abstracts away the differences
    between Unix signals and Windows console control events.
@@ -39,8 +39,10 @@ Out of scope items are enumerated in section 12.
 
 ## 4. Public API
 
-The public surface of `mod-signal 0.x.y` is the following set of
+The public surface of `signal-mod 1.x.y` is the following set of
 items, all re-exported from the crate root unless otherwise noted.
+Every item below is frozen by the `1.0.0` semver contract; see
+section 8 for the stability commitment.
 
 ### 4.1 Signal taxonomy
 
@@ -274,7 +276,7 @@ The core implementation is `#![deny(unsafe_code)]`. Signal
 installation is delegated to runtime crates (`tokio`,
 `signal-hook-async-std`) which carry their own audited `unsafe`. The
 runtime-less fallback uses `ctrlc 3.x`, which similarly contains the
-`unsafe` blocks behind a vetted boundary. `mod-signal` itself
+`unsafe` blocks behind a vetted boundary. `signal-mod` itself
 contains no `unsafe` blocks.
 
 If any `unsafe` is added in a future release, every block must carry
@@ -295,10 +297,22 @@ benchmarks land.
 
 ## 8. Stability guarantees
 
-`0.x.y` releases are not API-stable. Stability begins at `1.0.0`.
-Within the `0.x` line, `mod-signal` follows the convention that minor
-versions (`0.x.0`) may add and rearrange the public surface; patch
-versions (`0.x.y`) are bug fixes only.
+`signal-mod 1.0.0` is production-stable. Every public item
+re-exported from the crate root is covered by semantic versioning:
+
+- **Patch (`1.x.y`)** - bug fixes, dep bumps inside
+  semver-compatible ranges, doc improvements, CI fixes. No public
+  surface change.
+- **Minor (`1.x.0`)** - pure additions to the public surface,
+  new opt-in features, internal performance work that does not
+  change behavior. MSRV bumps allowed; see section 6.
+- **Major (`2.0.0`)** - anything that removes, renames, or
+  changes the signature of a public symbol, retires a feature
+  flag, or adds a non-opt-in runtime dependency.
+
+The `Error` enum is `#[non_exhaustive]`, so adding variants is a
+minor-version change. Downstream `match` arms must include a
+wildcard.
 
 ## 9. Dependency policy
 
