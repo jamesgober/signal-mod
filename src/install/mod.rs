@@ -2,7 +2,7 @@
 //!
 //! | Feature    | Back-end                                                    |
 //! | ---------- | ----------------------------------------------------------- |
-//! | `tokio`    | [`tokio_rt`]: one `tokio::signal` listener task per signal.  |
+//! | `tokio`    | [`tokio_rt`]: one `tokio::signal` listener task per signal (Unix); the shared console handler (Windows). |
 //! | `agnostic` | [`agnostic`]: a signal-hook listener thread on Unix, a console control handler on Windows. |
 //!
 //! Selection happens at install time: with `tokio` enabled and a Tokio
@@ -17,11 +17,17 @@
 use std::sync::Arc;
 
 use crate::dispatch::Dispatcher;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::signal::SignalSet;
 
 #[cfg(all(unix, any(feature = "tokio", feature = "agnostic")))]
 pub(crate) mod restore;
+
+#[cfg(all(unix, any(feature = "tokio", feature = "agnostic")))]
+pub(crate) mod disposition;
+
+#[cfg(all(windows, any(feature = "tokio", feature = "agnostic")))]
+pub(crate) mod console;
 
 #[cfg(feature = "tokio")]
 pub(crate) mod tokio_rt;
@@ -112,20 +118,23 @@ pub(crate) fn install(dispatcher: &Arc<Dispatcher>, set: SignalSet) -> Result<Re
     #[cfg(all(feature = "tokio", not(feature = "agnostic")))]
     {
         let _ = (dispatcher, set); // only the agnostic back-end could use them here
-        Err(Error::OutsideTokioRuntime)
+        Err(crate::error::Error::OutsideTokioRuntime)
     }
 
     #[cfg(not(any(feature = "tokio", feature = "agnostic")))]
     {
         let _ = (dispatcher, set); // no back-end compiled in
-        Err(Error::NoRuntime)
+        Err(crate::error::Error::NoRuntime)
     }
 }
 
 /// Map a registration failure for `sig` into the crate error.
-#[cfg(any(feature = "tokio", feature = "agnostic"))]
-pub(crate) fn registration_error(sig: crate::signal::Signal, source: std::io::Error) -> Error {
-    Error::SignalRegistration {
+#[cfg(all(unix, any(feature = "tokio", feature = "agnostic")))]
+pub(crate) fn registration_error(
+    sig: crate::signal::Signal,
+    source: std::io::Error,
+) -> crate::error::Error {
+    crate::error::Error::SignalRegistration {
         signal: sig,
         source,
     }

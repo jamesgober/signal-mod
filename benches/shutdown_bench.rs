@@ -106,13 +106,17 @@ fn bench_run_hooks(c: &mut Criterion) {
                             },
                         ));
                     }
-                    builder.build()
+                    let coord = builder.build();
+                    // Let the standby worker thread start and park, as it
+                    // has long before shutdown in a real program.
+                    std::thread::sleep(Duration::from_millis(2));
+                    coord
                 },
                 |coord| {
                     black_box(coord.run_hooks(ShutdownReason::Requested));
                     coord
                 },
-                BatchSize::SmallInput,
+                BatchSize::PerIteration,
             );
         });
     }

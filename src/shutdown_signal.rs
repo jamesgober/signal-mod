@@ -17,8 +17,9 @@ use crate::token::{ShutdownFuture, ShutdownToken};
 /// Made for `with_graceful_shutdown`-style APIs (axum, hyper, tonic,
 /// warp), which take a `Future<Output = ()> + Send + 'static`. The
 /// handlers live inside the returned [`ShutdownSignal`]: once the server
-/// drops it after the first signal, the default action applies again,
-/// so a second Ctrl+C terminates the process even if draining hangs.
+/// drops it after the first signal, signals that were at their default
+/// action get it back, so a second Ctrl+C terminates the process even if
+/// draining hangs (see [`Coordinator::install`] for the exact rules).
 ///
 /// For hooks, subscriptions, or escalation, build a [`Coordinator`]
 /// instead and pass `coord.token().wait()` to the server.

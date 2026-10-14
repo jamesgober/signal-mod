@@ -52,8 +52,9 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -244,12 +245,27 @@ fn execute(hook: &dyn ShutdownHook, reason: ShutdownReason) -> (HookStatus, Opti
     }
 }
 
-/// Budgets of one run, fixed when it starts.
+/// Deadlines of one run. The clock starts when the first worker is
+/// about to start the first hook, not when `run_hooks` is called, so
+/// thread start-up and scheduling delay before the first hook never eat
+/// into the graceful budget; the first hook always starts in the graceful
+/// phase (unless that budget is zero).
 #[derive(Clone, Copy)]
 struct Plan {
     reason: ShutdownReason,
     graceful_deadline: Option<Instant>,
     force_deadline: Option<Instant>,
+}
+
+impl Plan {
+    fn starting_now(reason: ShutdownReason, graceful: Duration, force: Duration) -> Self {
+        let start = Instant::now();
+        Self {
+            reason,
+            graceful_deadline: start.checked_add(graceful),
+            force_deadline: start.checked_add(force.max(graceful)),
+        }
+    }
 }
 
 impl Plan {
@@ -271,11 +287,46 @@ impl Plan {
 }
 
 /// The hook a worker is running.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Current {
     index: usize,
     started: Instant,
-    deadline: Option<Instant>,
+    control: Arc<HookControl>,
+}
+
+/// Per-hook state shared with the hook itself through
+/// [`HookContext`](crate::HookContext).
+#[derive(Debug)]
+pub(crate) struct HookControl {
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) abandoned: AtomicBool,
+}
+
+thread_local! {
+    /// The hook running on this worker thread, for `HookContext::current`.
+    static CURRENT_HOOK: core::cell::RefCell<Option<Arc<HookControl>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// The control block of the hook running on the calling thread.
+pub(crate) fn current_hook() -> Option<Arc<HookControl>> {
+    CURRENT_HOOK.with(|cell| cell.borrow().clone())
+}
+
+/// Sets the thread's current hook for the lifetime of the guard.
+struct CurrentHookGuard;
+
+impl CurrentHookGuard {
+    fn set(control: &Arc<HookControl>) -> Self {
+        CURRENT_HOOK.with(|cell| *cell.borrow_mut() = Some(Arc::clone(control)));
+        Self
+    }
+}
+
+impl Drop for CurrentHookGuard {
+    fn drop(&mut self) {
+        CURRENT_HOOK.with(|cell| *cell.borrow_mut() = None);
+    }
 }
 
 /// Shared between the supervisor and the current worker of one run.
@@ -290,9 +341,29 @@ struct Progress {
 }
 
 struct Run {
-    plan: Plan,
+    reason: ShutdownReason,
+    graceful: Duration,
+    force: Duration,
+    clock: OnceLock<Plan>,
     progress: Mutex<Progress>,
     changed: Condvar,
+}
+
+impl Run {
+    /// The run's deadlines, starting the clock on first use.
+    fn plan(&self) -> &Plan {
+        self.clock
+            .get_or_init(|| Plan::starting_now(self.reason, self.graceful, self.force))
+    }
+}
+
+/// Work handed to the standby worker.
+struct Assignment {
+    runner: Arc<HookRunner>,
+    run: Arc<Run>,
+    generation: u64,
+    from: usize,
+    ctx: RuntimeContext,
 }
 
 enum RunState {
@@ -308,6 +379,10 @@ pub(crate) struct HookRunner {
     force: Duration,
     state: Mutex<RunState>,
     done: Condvar,
+    /// A parked worker thread started at build time, so that running the
+    /// hooks does not pay for a thread spawn. `None` without hooks, once
+    /// used, or if it could not be spawned.
+    standby: Mutex<Option<mpsc::Sender<Assignment>>>,
 }
 
 impl fmt::Debug for HookRunner {
@@ -320,6 +395,28 @@ impl fmt::Debug for HookRunner {
     }
 }
 
+/// Start a parked worker that runs one assignment, or exits when the
+/// runner (and with it the sender) is dropped first.
+fn spawn_standby() -> Option<mpsc::Sender<Assignment>> {
+    let (tx, rx) = mpsc::channel::<Assignment>();
+    let spawned = thread::Builder::new()
+        .name("signal-mod-hook".into())
+        .spawn(move || {
+            if let Ok(job) = rx.recv() {
+                let _runtime = job.ctx.enter();
+                job.runner.work(&job.run, job.generation, job.from);
+            }
+        });
+    match spawned {
+        Ok(_detached) => Some(tx),
+        Err(error) => {
+            sm_warn!(error = %error, "could not pre-spawn the hook worker; it will start on demand");
+            drop(error);
+            None
+        }
+    }
+}
+
 impl HookRunner {
     pub(crate) fn new(
         mut hooks: Vec<Box<dyn ShutdownHook>>,
@@ -327,12 +424,18 @@ impl HookRunner {
         force: Duration,
     ) -> Self {
         hooks.sort_by_key(|h| core::cmp::Reverse(h.priority()));
+        let standby = if hooks.is_empty() {
+            None
+        } else {
+            spawn_standby()
+        };
         Self {
             slots: hooks.into_iter().map(HookSlot::new).collect(),
             graceful,
             force,
             state: Mutex::new(RunState::Idle),
             done: Condvar::new(),
+            standby: Mutex::new(standby),
         }
     }
 
@@ -384,11 +487,10 @@ impl HookRunner {
         sm_debug!(hooks = self.slots.len(), %reason, "running shutdown hooks");
         if !self.slots.is_empty() {
             let run = Arc::new(Run {
-                plan: Plan {
-                    reason,
-                    graceful_deadline: start.checked_add(self.graceful),
-                    force_deadline: start.checked_add(self.force.max(self.graceful)),
-                },
+                reason,
+                graceful: self.graceful,
+                force: self.force,
+                clock: OnceLock::new(),
                 progress: Mutex::new(Progress {
                     generation: 0,
                     current: None,
@@ -416,7 +518,7 @@ impl HookRunner {
             if progress.finished {
                 return;
             }
-            let Some(current) = progress.current else {
+            let Some(current) = progress.current.clone() else {
                 // The worker has not published its first hook yet; it
                 // notifies when it does (we are not sleeping on a
                 // deadline).
@@ -424,7 +526,7 @@ impl HookRunner {
                 progress = wait(&run.changed, progress);
                 continue;
             };
-            let Some(deadline) = current.deadline else {
+            let Some(deadline) = current.control.deadline else {
                 progress.supervisor_wakes_at = None;
                 progress = wait(&run.changed, progress);
                 continue;
@@ -440,6 +542,7 @@ impl HookRunner {
             };
             let ran_for = deadline.saturating_duration_since(current.started);
             if slot.try_finish(HookStatus::TimedOut, ran_for, None) {
+                current.control.abandoned.store(true, Ordering::Release);
                 sm_warn!(hook = %slot.name, "shutdown hook timed out; abandoning it");
                 progress.generation += 1;
                 progress.current = None;
@@ -453,7 +556,11 @@ impl HookRunner {
                 // The worker finished it in the meantime and moved on (or
                 // is about to publish the next hook).
                 progress.supervisor_wakes_at = None;
-                if progress.current.is_some_and(|c| c.index == current.index) {
+                if progress
+                    .current
+                    .as_ref()
+                    .is_some_and(|c| c.index == current.index)
+                {
                     progress = wait(&run.changed, progress);
                 }
             }
@@ -474,6 +581,18 @@ impl HookRunner {
         if from >= self.slots.len() {
             lock(&run.progress).finished = true;
             return false;
+        }
+        if let Some(standby) = lock(&self.standby).take() {
+            let assignment = Assignment {
+                runner: Arc::clone(self),
+                run: Arc::clone(run),
+                generation,
+                from,
+                ctx: ctx.clone(),
+            };
+            if standby.send(assignment).is_ok() {
+                return true;
+            }
         }
         let runner = Arc::clone(self);
         let worker_run = Arc::clone(run);
@@ -499,8 +618,11 @@ impl HookRunner {
     /// Worker body: run hooks `from..` while `generation` is current.
     fn work(&self, run: &Run, generation: u64, from: usize) {
         for (index, slot) in self.slots.iter().enumerate().skip(from) {
+            // Start the clock (first hook only) before reading the time,
+            // so a zero budget really is zero.
+            let plan = *run.plan();
             let started = Instant::now();
-            let Some((phase, phase_deadline, reason)) = run.plan.at(started) else {
+            let Some((phase, phase_deadline, reason)) = plan.at(started) else {
                 self.skip_rest(run, generation, index);
                 return;
             };
@@ -508,6 +630,10 @@ impl HookRunner {
                 slot.timeout.and_then(|t| started.checked_add(t)),
                 phase_deadline,
             );
+            let control = Arc::new(HookControl {
+                deadline,
+                abandoned: AtomicBool::new(false),
+            });
             {
                 let mut progress = lock(&run.progress);
                 if progress.generation != generation {
@@ -517,7 +643,7 @@ impl HookRunner {
                 progress.current = Some(Current {
                     index,
                     started,
-                    deadline,
+                    control: Arc::clone(&control),
                 });
                 // Wake the supervisor only if it would otherwise sleep
                 // past this hook's deadline.
@@ -531,7 +657,10 @@ impl HookRunner {
                 }
             }
             sm_debug!(hook = %slot.name, ?phase, "shutdown hook started");
-            let (status, panic) = execute(&*slot.hook, reason);
+            let (status, panic) = {
+                let _current = CurrentHookGuard::set(&control);
+                execute(&*slot.hook, reason)
+            };
             if !slot.try_finish(status, started.elapsed(), panic) {
                 // Timed out by the supervisor: this worker is retired.
                 return;
@@ -633,6 +762,18 @@ impl HookRunner {
 /// with the [`RunReport`] of that run. It never blocks the executor and
 /// works on any runtime. Dropping it does not cancel a run that has
 /// started.
+///
+/// # Examples
+///
+/// ```
+/// use signal_mod::{Coordinator, RunHooksFuture, ShutdownReason, hook_from_fn};
+///
+/// let coord = Coordinator::builder().hook(hook_from_fn("flush", 0, |_| {})).build();
+/// let run: RunHooksFuture = coord.run_hooks_async(ShutdownReason::Requested);
+/// // Any executor drives it; here a minimal one.
+/// let report = smol::block_on(run);
+/// assert_eq!(report.completed(), 1);
+/// ```
 #[must_use = "futures do nothing unless awaited"]
 pub struct RunHooksFuture {
     runner: Arc<HookRunner>,
@@ -714,7 +855,7 @@ mod tests {
         let r = runner(
             vec![
                 Box::new(hook_from_fn("hang", 1, |_| {
-                    thread::sleep(Duration::from_millis(300));
+                    thread::sleep(Duration::from_secs(30));
                 })),
                 Box::new(hook_from_fn("late", 0, |_| {})),
             ],

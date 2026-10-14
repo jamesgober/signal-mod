@@ -553,10 +553,8 @@ impl Iterator for SignalSetIter {
 
     #[inline]
     fn next(&mut self) -> Option<Signal> {
-        if self.bits == 0 {
-            return None;
-        }
-        while let Some(&sig) = Signal::ALL.get(self.index) {
+        while self.index < Signal::ALL.len() {
+            let sig = Signal::ALL[self.index];
             self.index += 1;
             if self.bits & sig.bit() != 0 {
                 return Some(sig);

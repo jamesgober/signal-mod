@@ -290,7 +290,7 @@ fn test_public_handles_and_futures_have_informative_debug() {
         format!("{:?}", coord.trigger()),
         format!("{sub:?}"),
     ] {
-        assert!(!text.is_empty());
+        assert_ne!(text, "");
     }
     assert!(format!("{guard:?}").contains("active_subsystems: 1"));
 }

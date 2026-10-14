@@ -274,7 +274,7 @@ mod tests {
             HookStatus::Skipped,
         ] {
             assert_eq!(HookStatus::from_u8(s.to_u8()), s);
-            assert!(!s.to_string().is_empty());
+            assert_ne!(s.to_string(), "");
         }
         assert_eq!(HookStatus::from_u8(200), HookStatus::Pending);
     }

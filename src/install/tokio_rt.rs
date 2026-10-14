@@ -1,17 +1,21 @@
-//! Tokio back-end: one `tokio::signal` listener task per signal.
+//! Tokio back-end.
 //!
-//! Registration is all-or-nothing: every stream is created before any
-//! task is spawned, so a failure part-way leaves nothing behind (1.0.0
-//! left the earlier listeners running).
-//!
-//! Uninstalling aborts the tasks, which drops the streams. On Windows,
-//! Tokio's console handler then reports "not handled" and the OS default
-//! (terminate) applies again. On Unix, Tokio never removes its handler,
-//! so [`restore`](super::restore) arms the default action instead.
+//! - **Unix:** one `tokio::signal` listener task per signal. Registration
+//!   is all-or-nothing: every stream is created before any task is
+//!   spawned, so a failure part-way leaves nothing behind (1.0.0 left the
+//!   earlier listeners running). Uninstalling aborts the tasks; because
+//!   Tokio never removes its OS handler, [`restore`](super::restore)
+//!   brings back the default action where that was the prior one.
+//! - **Windows:** the shared console control handler in
+//!   [`console`](super::console). A Tokio-installed and an
+//!   agnostic-installed coordinator in one process therefore both see
+//!   every event (with separate handlers, Windows would stop at the
+//!   first one that claims the event).
 
 use std::sync::Arc;
 
 use tokio::runtime::Handle;
+#[cfg(not(windows))]
 use tokio::task::JoinHandle;
 
 use crate::dispatch::Dispatcher;
@@ -21,8 +25,14 @@ use crate::signal::SignalSet;
 /// Running listener tasks.
 #[derive(Debug)]
 pub(crate) struct Registration {
+    #[cfg(not(windows))]
     tasks: Vec<JoinHandle<()>>,
+    #[cfg(windows)]
+    console: u64,
     covered: SignalSet,
+    /// Signals counted by [`restore::acquire`](super::restore::acquire).
+    #[cfg(unix)]
+    restored: SignalSet,
 }
 
 impl Registration {
@@ -31,11 +41,14 @@ impl Registration {
     }
 
     pub(crate) fn uninstall(self) {
+        #[cfg(not(windows))]
         for task in &self.tasks {
             task.abort();
         }
+        #[cfg(windows)]
+        super::console::unregister(self.console);
         #[cfg(unix)]
-        super::restore::release(self.covered);
+        super::restore::release(self.restored);
         sm_debug!(signals = ?self.covered, "tokio signal listeners removed");
     }
 }
@@ -49,6 +62,9 @@ pub(crate) fn install(
     use tokio::signal::unix::{SignalKind, signal};
 
     let _context = handle.enter();
+    // Read the prior dispositions before Tokio registers anything.
+    let restored = super::restore::acquire(set, dispatcher.shutdown_set())
+        .map_err(|(sig, e)| super::registration_error(sig, e))?;
     let mut streams = Vec::with_capacity(set.len());
     for sig in set {
         let Some(number) = sig.unix_number() else {
@@ -62,11 +78,14 @@ pub(crate) fn install(
                 "the Tokio runtime has no signal driver; build it with enable_io() or enable_all()",
             ))
         });
-        let stream = created.map_err(|e| super::registration_error(sig, e))?;
-        streams.push((sig, stream));
+        match created {
+            Ok(stream) => streams.push((sig, stream)),
+            Err(e) => {
+                super::restore::release(restored);
+                return Err(super::registration_error(sig, e));
+            }
+        }
     }
-
-    super::restore::acquire(set).map_err(|(sig, e)| super::registration_error(sig, e))?;
 
     let tasks = streams
         .into_iter()
@@ -83,53 +102,23 @@ pub(crate) fn install(
     Ok(Registration {
         tasks,
         covered: set,
+        restored,
     })
 }
 
 #[cfg(windows)]
 pub(crate) fn install(
-    handle: &Handle,
+    _handle: &Handle,
     dispatcher: &Arc<Dispatcher>,
     set: SignalSet,
 ) -> Result<Registration> {
-    use crate::signal::Signal;
-    use tokio::signal::windows;
-
-    // One boxed future factory per console event; created eagerly so a
-    // failure leaves nothing spawned.
-    type Listener = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
-    let mut listeners: Vec<Listener> = Vec::new();
-
-    macro_rules! listen {
-        ($sig:expr, $factory:path) => {{
-            let mut stream = $factory().map_err(|e| super::registration_error($sig, e))?;
-            let dispatcher = Arc::clone(dispatcher);
-            listeners.push(Box::pin(async move {
-                while stream.recv().await.is_some() {
-                    dispatcher.deliver($sig);
-                }
-            }));
-        }};
-    }
-
     let covered = set.available_on_current_platform();
-    if covered.contains(Signal::Interrupt) {
-        listen!(Signal::Interrupt, windows::ctrl_c);
-    }
-    if covered.contains(Signal::Quit) {
-        listen!(Signal::Quit, windows::ctrl_break);
-    }
-    if covered.contains(Signal::Terminate) {
-        listen!(Signal::Terminate, windows::ctrl_close);
-    }
-    if covered.contains(Signal::Hangup) {
-        listen!(Signal::Hangup, windows::ctrl_logoff);
-        listen!(Signal::Hangup, windows::ctrl_shutdown);
-    }
-
-    let tasks = listeners.into_iter().map(|l| handle.spawn(l)).collect();
-    sm_debug!(signals = ?covered, "tokio console-event listeners installed");
-    Ok(Registration { tasks, covered })
+    // One OS call covers every event, so a failure is not attributable to
+    // a single signal.
+    let console = super::console::register(dispatcher, covered)
+        .map_err(crate::error::Error::ListenerThread)?;
+    sm_debug!(signals = ?covered, "console control handler registered (tokio back-end)");
+    Ok(Registration { console, covered })
 }
 
 #[cfg(not(any(unix, windows)))]

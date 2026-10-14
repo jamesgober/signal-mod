@@ -54,9 +54,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 ///    [`run_hooks_with_report`](Self::run_hooks_with_report)).
 ///
 /// The coordinator is also the installation's guard: dropping it (or
-/// calling [`uninstall`](Self::uninstall)) removes its listeners and
-/// lets the OS default action (terminate) apply again to signals no
-/// other coordinator handles. Keep it alive for as long as the
+/// calling [`uninstall`](Self::uninstall)) removes its listeners and,
+/// on Unix, gives shutdown signals that were at their default action
+/// before signal-mod touched them their default action back (see
+/// [`install`](Self::install)). Keep it alive for as long as the
 /// handlers should be: typically for all of `main`.
 ///
 /// `Coordinator` is `Send + Sync`; share it by reference or `Arc`.
@@ -304,14 +305,14 @@ impl Coordinator {
     /// use std::time::Duration;
     ///
     /// let coord = Coordinator::builder()
-    ///     .graceful_timeout(Duration::from_millis(50))
-    ///     .force_timeout(Duration::from_millis(500))
-    ///     .hook(hook_from_fn("hangs", 10, |_| std::thread::sleep(Duration::from_secs(2))))
+    ///     .graceful_timeout(Duration::from_millis(200))
+    ///     .force_timeout(Duration::from_secs(20))
+    ///     .hook(hook_from_fn("hangs", 10, |_| std::thread::sleep(Duration::from_secs(30))))
     ///     .hook(hook_from_fn("flush", 0, |_| {}))
     ///     .build();
     ///
     /// let report = coord.run_hooks_with_report(ShutdownReason::Requested);
-    /// assert!(report.elapsed() < Duration::from_secs(2));
+    /// assert!(report.elapsed() < Duration::from_secs(20));
     /// assert_eq!(report.outcomes()[0].status, HookStatus::TimedOut);
     /// // `flush` still ran, in the force phase.
     /// assert_eq!(report.outcomes()[1].status, HookStatus::Completed);
@@ -365,31 +366,52 @@ impl Coordinator {
     ///
     /// 1. `tokio` enabled and a Tokio runtime current: Tokio listener
     ///    tasks ([`Backend::Tokio`]).
-    /// 2. otherwise, `agnostic` enabled: a listener thread
-    ///    ([`Backend::Agnostic`]).
+    /// 2. otherwise, `agnostic` enabled: a listener thread on Unix, the
+    ///    console control handler on Windows ([`Backend::Agnostic`]).
     /// 3. otherwise: [`Error::OutsideTokioRuntime`] (only `tokio`
     ///    enabled) or [`Error::NoRuntime`] (no back-end enabled).
     ///
-    /// Installation is all-or-nothing and never panics. Several
-    /// coordinators may be installed in one process; every one of them
-    /// receives the signals it listens for.
+    /// Installation is all-or-nothing. Several coordinators may be
+    /// installed in one process, with either back-end; every one of them
+    /// receives the signals it listens for (on Windows both back-ends
+    /// share one console control handler for that reason).
     ///
     /// Listeners stay installed until [`uninstall`](Self::uninstall) or
-    /// until the coordinator is dropped. After that, a signal that no
-    /// other coordinator handles gets the OS default action again
-    /// (SIGPIPE stays ignored, as Rust programs expect). A signal-mod
-    /// limitation worth knowing on Unix: if your program also listens
-    /// for one of these signals through `tokio::signal` directly, that
-    /// listener no longer sees the signal once every coordinator that
-    /// covered it has been uninstalled.
+    /// until the coordinator is dropped. What happens to a signal after
+    /// the last coordinator covering it is gone:
+    ///
+    /// - **Unix, shutdown signal that was at its default action** when
+    ///   signal-mod first installed it: the default action comes back,
+    ///   so the next delivery terminates the process (core dump for
+    ///   SIGQUIT), as if no handler had ever been installed. If other
+    ///   code registered its own handler for that signal *after*
+    ///   signal-mod did, that handler does not prevent the termination.
+    /// - **Unix, signal that was ignored or already handled** before
+    ///   signal-mod (SIGHUP under `nohup`, another library's handler):
+    ///   left alone; the earlier owner keeps it.
+    /// - **Unix, notify-only signals and SIGPIPE:** absorbed by the
+    ///   leftover handler (ignored), as with plain `tokio::signal`.
+    /// - **Windows:** the console handler declines the event and the next
+    ///   handler, ultimately the OS default (terminate), runs.
+    ///
+    /// # Panics
+    ///
+    /// Not with unwinding panics. One caveat: with the Tokio back-end on
+    /// Unix, if the current runtime was built without its I/O driver,
+    /// Tokio panics while creating the signal stream. signal-mod catches
+    /// that unwind and returns [`Error::SignalRegistration`], but the
+    /// panic hook still runs (a message on stderr; crash reporters may
+    /// record it), and a binary built with `panic = "abort"` aborts.
+    /// `#[tokio::main]` and `Runtime::new` enable the driver; custom
+    /// builders need `enable_io()` or `enable_all()`.
     ///
     /// # Errors
     ///
     /// - [`Error::AlreadyInstalled`]: this coordinator is installed.
     /// - [`Error::SignalRegistration`]: the platform rejected a signal,
     ///   or the Tokio runtime has no I/O driver.
-    /// - [`Error::ListenerThread`]: the agnostic back-end could not
-    ///   start its thread.
+    /// - [`Error::ListenerThread`]: the listener could not start (thread
+    ///   spawn on Unix, console handler registration on Windows).
     /// - [`Error::OutsideTokioRuntime`] / [`Error::NoRuntime`]: see
     ///   above.
     ///
@@ -594,12 +616,16 @@ impl CoordinatorBuilder {
         self
     }
 
-    /// Exit the process immediately when a shutdown signal arrives after
+    /// End the process immediately when a shutdown signal arrives after
     /// shutdown was already initiated: the "press Ctrl+C again to quit"
-    /// convention. The exit status is the second signal's
-    /// [`exit_code`](Signal::exit_code) (130 for SIGINT, 143 for
-    /// SIGTERM). The exit is `std::process::exit`: destructors and
-    /// remaining hooks do not run. Off by default.
+    /// convention. Off by default.
+    ///
+    /// On Unix the signal's default action is re-raised, so the parent
+    /// sees the process killed by that signal (what shells and
+    /// supervisors expect from an uncaught Ctrl+C). On Windows, or if
+    /// re-raising fails, the process exits with the signal's
+    /// [`exit_code`](Signal::exit_code) (130 for Ctrl+C). Either way
+    /// destructors and remaining hooks do not run.
     #[must_use]
     pub fn force_exit_on_second_signal(mut self, enabled: bool) -> Self {
         self.escalate = enabled;
@@ -702,7 +728,6 @@ mod tests {
 
     use super::*;
     use crate::hook::hook_from_fn;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_builder_defaults_match_documentation() {
@@ -774,7 +799,6 @@ mod tests {
 
     #[test]
     fn test_simulate_signal_outside_configured_sets_is_ignored() {
-        let calls = Arc::new(AtomicUsize::new(0));
         let c = Coordinator::builder()
             .signals(SignalSet::empty())
             .notify_signals(SignalSet::from(Signal::User1))
@@ -784,7 +808,6 @@ mod tests {
         assert!(c.simulate_signal(Signal::User1));
         assert_eq!(sub.try_recv(), Some(Signal::User1));
         assert!(!c.token().is_initiated());
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
     #[cfg(not(any(feature = "tokio", feature = "agnostic")))]

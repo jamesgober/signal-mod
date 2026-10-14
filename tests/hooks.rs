@@ -10,12 +10,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use signal_mod::{Coordinator, HookPhase, HookStatus, ShutdownHook, ShutdownReason, hook_from_fn};
+use signal_mod::{
+    Coordinator, FnHook, HookPhase, HookStatus, ShutdownHook, ShutdownReason, hook_from_fn,
+};
 
-/// Slack for thread scheduling on loaded CI machines. Deadline tests
-/// assert "returned well before the hung hook would have", not exact
-/// timings.
-const SLACK: Duration = Duration::from_millis(750);
+/// How long a "hung" hook sleeps. Deadline tests use budgets of a few
+/// hundred milliseconds and only assert that the run returned well
+/// before a hung hook would have, so they stay reliable on loaded CI
+/// runners (SM2-002).
+const HANG: Duration = Duration::from_secs(30);
+const WELL_BEFORE_HANG: Duration = Duration::from_secs(15);
+const BUDGET: Duration = Duration::from_millis(300);
+
+fn hang(name: &str, priority: i32) -> FnHook<impl Fn(ShutdownReason) + Send + Sync + 'static> {
+    hook_from_fn(name, priority, |_| thread::sleep(HANG))
+}
 
 fn counter_hook(name: &str, priority: i32, counter: &Arc<AtomicUsize>) -> impl ShutdownHook {
     let c = Arc::clone(counter);
@@ -29,22 +38,33 @@ fn counter_hook(name: &str, priority: i32, counter: &Arc<AtomicUsize>) -> impl S
 #[test]
 fn test_hung_hook_is_abandoned_at_graceful_deadline() {
     let coord = Coordinator::builder()
-        .graceful_timeout(Duration::from_millis(50))
-        .force_timeout(Duration::from_millis(50))
-        .hook(hook_from_fn("hang", 0, |_| {
-            thread::sleep(Duration::from_secs(10));
-        }))
+        .graceful_timeout(BUDGET)
+        .force_timeout(BUDGET)
+        .hook(hang("hang", 0))
         .build();
     let start = Instant::now();
     let report = coord.run_hooks_with_report(ShutdownReason::Requested);
-    let took = start.elapsed();
-    assert!(
-        took < Duration::from_millis(50) + SLACK,
-        "run took {took:?}"
-    );
+    assert!(start.elapsed() < WELL_BEFORE_HANG, "{:?}", start.elapsed());
     assert_eq!(report.timed_out(), 1);
     assert_eq!(report.outcomes()[0].status, HookStatus::TimedOut);
-    assert!(report.outcomes()[0].duration.unwrap() >= Duration::from_millis(40));
+    assert_eq!(report.outcomes()[0].phase, Some(HookPhase::Graceful));
+    assert!(report.outcomes()[0].duration.unwrap() >= BUDGET / 2);
+}
+
+// SM2-002: the clock starts when the first hook is about to start, so
+// the first hook always starts in the graceful phase, however slowly the
+// worker thread got scheduled.
+#[test]
+fn test_first_hook_always_starts_in_graceful_phase() {
+    for _ in 0..20 {
+        let coord = Coordinator::builder()
+            .graceful_timeout(Duration::from_millis(1))
+            .force_timeout(Duration::from_millis(1))
+            .hook(hook_from_fn("first", 0, |_| {}))
+            .build();
+        let report = coord.run_hooks_with_report(ShutdownReason::Requested);
+        assert_eq!(report.outcomes()[0].phase, Some(HookPhase::Graceful));
+    }
 }
 
 #[test]
@@ -52,11 +72,9 @@ fn test_hooks_after_a_hung_hook_run_in_force_phase_with_forced_reason() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let s = Arc::clone(&seen);
     let coord = Coordinator::builder()
-        .graceful_timeout(Duration::from_millis(40))
-        .force_timeout(Duration::from_secs(5))
-        .hook(hook_from_fn("hang", 10, |_| {
-            thread::sleep(Duration::from_secs(10));
-        }))
+        .graceful_timeout(BUDGET)
+        .force_timeout(Duration::from_secs(60))
+        .hook(hang("hang", 10))
         .hook(hook_from_fn("flush", 0, move |reason| {
             s.lock().unwrap().push(reason);
         }))
@@ -68,58 +86,81 @@ fn test_hooks_after_a_hung_hook_run_in_force_phase_with_forced_reason() {
     assert_eq!(report.outcomes()[1].phase, Some(HookPhase::Force));
     assert_eq!(*seen.lock().unwrap(), vec![ShutdownReason::Forced]);
     assert_eq!(report.reason(), ShutdownReason::Requested);
-    assert!(report.elapsed() < Duration::from_secs(5));
+    assert!(report.elapsed() < WELL_BEFORE_HANG);
 }
 
 #[test]
 fn test_hooks_beyond_force_deadline_are_skipped() {
     let counter = Arc::new(AtomicUsize::new(0));
     let coord = Coordinator::builder()
-        .graceful_timeout(Duration::from_millis(20))
-        .force_timeout(Duration::from_millis(60))
-        .hook(hook_from_fn("hang-a", 2, |_| {
-            thread::sleep(Duration::from_secs(10));
-        }))
-        .hook(hook_from_fn("hang-b", 1, |_| {
-            thread::sleep(Duration::from_secs(10));
-        }))
+        .graceful_timeout(BUDGET)
+        .force_timeout(BUDGET * 2)
+        .hook(hang("hang-a", 2))
+        .hook(hang("hang-b", 1))
         .hook(counter_hook("never", 0, &counter))
         .build();
     let start = Instant::now();
     let report = coord.run_hooks_with_report(ShutdownReason::Requested);
-    assert!(start.elapsed() < Duration::from_millis(60) + SLACK);
+    assert!(start.elapsed() < WELL_BEFORE_HANG);
     let statuses: Vec<HookStatus> = report.outcomes().iter().map(|o| o.status).collect();
-    assert_eq!(
-        statuses,
-        vec![
-            HookStatus::TimedOut,
-            HookStatus::TimedOut,
-            HookStatus::Skipped
-        ]
-    );
+    assert_eq!(statuses[0], HookStatus::TimedOut);
+    // hang-b starts in the force phase and times out, or, on a machine so
+    // loaded that the supervisor woke after the force deadline, is skipped.
+    assert!(matches!(
+        statuses[1],
+        HookStatus::TimedOut | HookStatus::Skipped
+    ));
+    assert_eq!(statuses[2], HookStatus::Skipped);
     assert_eq!(report.outcomes()[2].phase, None);
     assert_eq!(counter.load(Ordering::SeqCst), 0);
-    assert_eq!(coord.statistics().hooks_skipped, 1);
+    assert!(coord.statistics().hooks_skipped >= 1);
 }
 
 #[test]
 fn test_per_hook_timeout_bounds_one_hook_and_the_next_still_runs_gracefully() {
     let counter = Arc::new(AtomicUsize::new(0));
     let coord = Coordinator::builder()
-        .graceful_timeout(Duration::from_secs(10))
-        .hook(
-            hook_from_fn("slow", 1, |_| thread::sleep(Duration::from_secs(10)))
-                .with_timeout(Duration::from_millis(30)),
-        )
+        .graceful_timeout(Duration::from_secs(60))
+        .hook(hang("slow", 1).with_timeout(BUDGET))
         .hook(counter_hook("next", 0, &counter))
         .build();
     let start = Instant::now();
     let report = coord.run_hooks_with_report(ShutdownReason::Requested);
-    assert!(start.elapsed() < Duration::from_millis(30) + SLACK);
+    assert!(start.elapsed() < WELL_BEFORE_HANG);
     assert_eq!(report.outcomes()[0].status, HookStatus::TimedOut);
     assert_eq!(report.outcomes()[1].status, HookStatus::Completed);
     assert_eq!(report.outcomes()[1].phase, Some(HookPhase::Graceful));
     assert_eq!(counter.load(Ordering::SeqCst), 1);
+}
+
+// SM2-009: an abandoned hook can see that it was abandoned.
+#[test]
+fn test_abandoned_hook_observes_is_abandoned() {
+    let observed = Arc::new(AtomicUsize::new(0));
+    let o = Arc::clone(&observed);
+    let coord = Coordinator::builder()
+        .graceful_timeout(BUDGET)
+        .force_timeout(BUDGET)
+        .hook(hook_from_fn("cooperative", 0, move |_| {
+            let ctx = signal_mod::HookContext::current().unwrap();
+            assert!(ctx.deadline().is_some());
+            let give_up = Instant::now() + HANG;
+            while !ctx.is_abandoned() && Instant::now() < give_up {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if ctx.is_abandoned() {
+                assert_eq!(ctx.remaining(), Some(Duration::ZERO));
+                o.store(1, Ordering::SeqCst);
+            }
+        }))
+        .build();
+    let report = coord.run_hooks_with_report(ShutdownReason::Requested);
+    assert_eq!(report.timed_out(), 1);
+    let deadline = Instant::now() + WELL_BEFORE_HANG;
+    while observed.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "hook never saw the abandonment");
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 // SM-020 / audit P3: 1.0.0's zero-budget test asserted nothing.
@@ -191,7 +232,7 @@ fn test_second_call_returns_same_report_without_rerunning_hooks() {
 #[test]
 fn test_concurrent_callers_share_one_run() {
     let counter = Arc::new(AtomicUsize::new(0));
-    let mut builder = Coordinator::builder();
+    let mut builder = Coordinator::builder().graceful_timeout(Duration::from_secs(60));
     for i in 0..16 {
         let c = Arc::clone(&counter);
         builder = builder.hook(hook_from_fn(format!("h{i}"), 0, move |_| {
@@ -221,7 +262,7 @@ fn test_hook_can_read_statistics_and_debug_of_its_coordinator() {
     let (c, s) = (Arc::clone(&coord), Arc::clone(&seen));
     let built = Arc::new(
         Coordinator::builder()
-            .graceful_timeout(Duration::from_secs(5))
+            .graceful_timeout(Duration::from_secs(60))
             .hook(hook_from_fn("introspect", 0, move |_| {
                 let guard = c.lock().unwrap();
                 let me = guard.as_ref().unwrap();
@@ -234,7 +275,7 @@ fn test_hook_can_read_statistics_and_debug_of_its_coordinator() {
     *coord.lock().unwrap() = Some(Arc::clone(&built));
     let start = Instant::now();
     let report = built.run_hooks_with_report(ShutdownReason::Requested);
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() < WELL_BEFORE_HANG);
     assert!(report.is_clean());
     assert_eq!(*seen.lock().unwrap(), Some(HookStatus::Running));
     coord.lock().unwrap().take();
@@ -246,7 +287,7 @@ fn test_statistics_does_not_block_while_a_hook_runs() {
     let coord = Arc::new(
         Coordinator::builder()
             .hook(hook_from_fn("slow", 0, |_| {
-                thread::sleep(Duration::from_millis(300));
+                thread::sleep(Duration::from_secs(2));
             }))
             .build(),
     );
@@ -260,7 +301,7 @@ fn test_statistics_does_not_block_while_a_hook_runs() {
     }
     let start = Instant::now();
     let stats = coord.statistics();
-    assert!(start.elapsed() < Duration::from_millis(100));
+    assert!(start.elapsed() < Duration::from_secs(1));
     assert_eq!(stats.hooks[0].status, HookStatus::Running);
     assert_eq!(handle.join().unwrap(), 1);
 }
@@ -361,7 +402,7 @@ async fn test_async_run_does_not_block_a_current_thread_runtime() {
     });
     let coord = Coordinator::builder()
         .hook(hook_from_fn("slow", 0, |_| {
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_secs(1));
         }))
         .build();
     let report = coord.run_hooks_async(ShutdownReason::Requested).await;

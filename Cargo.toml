@@ -75,10 +75,11 @@ default = ["std", "tokio"]
 std = []
 
 # Tokio back-end. `Coordinator::install` called inside a Tokio runtime
-# spawns one listener task per signal via `tokio::signal`. On Unix,
-# `signal-hook` restores the default disposition when the coordinator
-# is uninstalled or dropped.
-tokio = ["dep:tokio", "dep:signal-hook"]
+# spawns one listener task per signal via `tokio::signal` on Unix, where
+# `signal-hook` restores a default disposition after uninstall. On
+# Windows it shares the console control handler (windows-sys) with the
+# agnostic back-end, so coordinators of both kinds see every event.
+tokio = ["dep:tokio", "dep:signal-hook", "dep:windows-sys"]
 
 # Runtime-agnostic back-end. Signals feed the runtime-agnostic
 # `ShutdownToken::wait` future, so it works under smol, async-std, any
@@ -129,9 +130,9 @@ libc = "0.2.155"
 signal-hook = { version = "0.4", optional = true, default-features = false, features = ["iterator"] }
 
 [target.'cfg(windows)'.dependencies]
-# Optional (feature `agnostic`). `SetConsoleCtrlHandler`, the one FFI
-# call the agnostic back-end needs on Windows. Already in every Tokio
-# build on Windows.
+# Optional (features `tokio`, `agnostic`). `SetConsoleCtrlHandler`, the
+# one FFI call the back-ends need on Windows. Already in every Tokio build
+# on Windows.
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_System_Console"] }
 
 [dev-dependencies]
@@ -148,8 +149,10 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 smol = "2"
 
 [target.'cfg(all(unix, not(loom)))'.dev-dependencies]
-# Real-signal integration tests raise signals inside a child process.
+# Real-signal integration tests raise signals inside a child process,
+# register foreign handlers and set SIG_IGN.
 signal-hook = { version = "0.4", default-features = false }
+libc = "0.2.155"
 
 [target.'cfg(all(windows, not(loom)))'.dev-dependencies]
 # Real console-event integration test (`GenerateConsoleCtrlEvent`).

@@ -1,9 +1,12 @@
 //! Shutdown hook trait and closure adapter.
 
 use core::fmt;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use crate::reason::ShutdownReason;
+use crate::runner::{HookControl, current_hook};
 
 /// A unit of cleanup work to run during shutdown.
 ///
@@ -31,6 +34,12 @@ use crate::reason::ShutdownReason;
 ///   Hooks must therefore not rely on a later hook not having started.
 /// - A panic inside `run` is caught, reported with its message, and
 ///   does not stop the remaining hooks.
+/// - Inside `run`, [`HookContext::current`] gives the hook's deadline and
+///   tells it when it has been abandoned, so long-running cleanup can
+///   stop early. An abandoned hook that holds a lock the rest of the
+///   program needs keeps holding it until it returns: keep critical
+///   sections in hooks short, or check
+///   [`HookContext::is_abandoned`] between steps.
 ///
 /// # Examples
 ///
@@ -80,6 +89,88 @@ pub trait ShutdownHook: Send + Sync + 'static {
     /// [`ShutdownReason::Forced`] if the hook starts after the graceful
     /// budget has elapsed (the force phase).
     fn run(&self, reason: ShutdownReason);
+}
+
+/// The deadline and abandonment state of the hook running on the
+/// current thread.
+///
+/// Obtained with [`HookContext::current`] from inside
+/// [`ShutdownHook::run`]. Hooks cannot be stopped from the outside; this
+/// is how a hook cooperates: it can size its work to
+/// [`remaining`](Self::remaining) and stop once
+/// [`is_abandoned`](Self::is_abandoned) turns `true` (the run has
+/// reported it `TimedOut` and moved on).
+///
+/// # Examples
+///
+/// ```
+/// use signal_mod::{Coordinator, HookContext, ShutdownReason, hook_from_fn};
+/// use std::time::Duration;
+///
+/// let coord = Coordinator::builder()
+///     .hook(
+///         hook_from_fn("flush-batches", 0, |_| {
+///             let ctx = HookContext::current().expect("inside a hook");
+///             for _batch in 0..3 {
+///                 if ctx.is_abandoned() {
+///                     return; // the run gave up on us; stop touching state
+///                 }
+///                 // flush one batch ...
+///             }
+///             assert!(ctx.remaining().is_some());
+///         })
+///         .with_timeout(Duration::from_secs(5)),
+///     )
+///     .build();
+/// assert_eq!(coord.run_hooks(ShutdownReason::Requested), 1);
+/// assert!(HookContext::current().is_none()); // not inside a hook
+/// ```
+#[derive(Clone)]
+pub struct HookContext {
+    control: Arc<HookControl>,
+}
+
+impl HookContext {
+    /// The context of the hook running on this thread; `None` outside
+    /// [`ShutdownHook::run`].
+    #[must_use]
+    pub fn current() -> Option<Self> {
+        current_hook().map(|control| Self { control })
+    }
+
+    /// When this hook will be abandoned: the earlier of its own
+    /// [`timeout`](ShutdownHook::timeout) and the end of the phase it
+    /// started in. `None` if no deadline applies.
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
+        self.control.deadline
+    }
+
+    /// Time left before [`deadline`](Self::deadline) (zero once it has
+    /// passed); `None` if no deadline applies.
+    #[must_use]
+    pub fn remaining(&self) -> Option<Duration> {
+        self.control
+            .deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
+    /// `true` once the run has given up on this hook (reported it
+    /// `TimedOut` and moved on). The hook should return as soon as it
+    /// can.
+    #[must_use]
+    pub fn is_abandoned(&self) -> bool {
+        self.control.abandoned.load(Ordering::Acquire)
+    }
+}
+
+impl fmt::Debug for HookContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HookContext")
+            .field("deadline", &self.control.deadline)
+            .field("abandoned", &self.is_abandoned())
+            .finish()
+    }
 }
 
 /// Closure-backed [`ShutdownHook`].

@@ -55,8 +55,8 @@ impl Dispatcher {
     ///
     /// Subscribers see every delivered signal. A signal in the shutdown
     /// set initiates shutdown; if shutdown was already initiated and
-    /// escalation is enabled, the process exits immediately with the
-    /// signal's conventional status.
+    /// escalation is enabled, the process ends immediately (see
+    /// [`escalate`]).
     pub(crate) fn deliver(&self, sig: Signal) {
         sm_info!(signal = %sig, "signal received");
         self.notify_subscribers(sig);
@@ -65,9 +65,7 @@ impl Dispatcher {
         }
         let first = self.trigger.trigger(ShutdownReason::Signal(sig));
         if !first && self.escalate {
-            let code = sig.exit_code();
-            sm_warn!(signal = %sig, code, "second shutdown signal; exiting immediately");
-            std::process::exit(code);
+            escalate(sig);
         }
     }
 
@@ -82,9 +80,23 @@ impl Dispatcher {
         }
     }
 
+    /// Signals that initiate shutdown.
+    #[cfg(all(unix, any(feature = "tokio", feature = "agnostic")))]
+    pub(crate) fn shutdown_set(&self) -> SignalSet {
+        self.shutdown
+    }
+
     pub(crate) fn subscribe(&self) -> SignalSubscription {
         let sub = Arc::new(Subscriber::default());
-        lock(&self.subscribers).push(Arc::downgrade(&sub));
+        let mut subs = lock(&self.subscribers);
+        // Prune dropped subscriptions before the vector would grow, so
+        // subscribe/drop churn without deliveries stays bounded
+        // (amortised O(1)).
+        if subs.len() == subs.capacity() {
+            subs.retain(|weak| weak.strong_count() > 0);
+        }
+        subs.push(Arc::downgrade(&sub));
+        drop(subs);
         SignalSubscription { shared: sub }
     }
 }
@@ -96,6 +108,28 @@ impl Drop for Dispatcher {
             sub.close();
         }
     }
+}
+
+/// End the process because of a second shutdown signal.
+///
+/// On Unix (with a back-end that can install handlers) the signal's
+/// default action is re-raised, so the parent sees the process killed by
+/// that signal, exactly as if no handler had been installed (shells
+/// treat a SIGINT death differently from an exit status). Elsewhere, or
+/// if re-raising fails, the process exits with
+/// [`Signal::exit_code`] (128 + number).
+fn escalate(sig: Signal) -> ! {
+    let code = sig.exit_code();
+    sm_warn!(signal = %sig, code, "second shutdown signal; ending the process");
+    #[cfg(all(unix, any(feature = "tokio", feature = "agnostic")))]
+    if let Some(number) = sig.unix_number() {
+        // Only returns if the default action did not end the process.
+        if let Err(error) = signal_hook::low_level::emulate_default_handler(number) {
+            sm_warn!(signal = %sig, error = %error, "could not re-raise; exiting instead");
+            drop(error);
+        }
+    }
+    std::process::exit(code)
 }
 
 #[derive(Debug)]
@@ -407,6 +441,17 @@ mod tests {
         assert_eq!(sub.recv_blocking(), Some(Signal::Quit));
         assert!(handle.join().is_ok());
         assert!(format!("{sub:?}").contains("closed: false"));
+    }
+
+    #[test]
+    fn test_subscribe_drop_churn_without_deliveries_stays_bounded() {
+        let (_inner, d) = dispatcher(SignalSet::empty());
+        let _kept = d.subscribe();
+        for _ in 0..10_000 {
+            drop(d.subscribe());
+        }
+        let len = lock(&d.subscribers).len();
+        assert!(len <= 16, "{len} entries kept for 1 live subscription");
     }
 
     #[test]

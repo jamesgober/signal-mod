@@ -1,7 +1,7 @@
 //! Synchronization primitives used by the shutdown state machine.
 //!
 //! Under `--cfg loom` these resolve to `loom`'s model-checked
-//! equivalents so `tests/loom.rs` can explore every interleaving of
+//! equivalents so the models in `loom_tests.rs` can explore every interleaving of
 //! trigger / wait / reason. Everything else in the crate (hook runner,
 //! dispatcher, back-ends) uses `std` directly: it is either not
 //! concurrent in an interesting way or is covered by real-thread

@@ -69,9 +69,10 @@ pub enum Error {
     /// no runtime. Nothing was installed.
     OutsideTokioRuntime,
 
-    /// The agnostic back-end could not start its listener thread
-    /// (`std::thread::Builder::spawn` failed, usually from resource
-    /// exhaustion). Nothing was installed; the call can be retried.
+    /// The listener could not start: on Unix the agnostic back-end's
+    /// thread or self-pipe (resource exhaustion), on Windows the
+    /// registration of the console control handler. Nothing was
+    /// installed; the call can be retried.
     ListenerThread(io::Error),
 }
 

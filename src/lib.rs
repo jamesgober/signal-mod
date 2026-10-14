@@ -59,7 +59,7 @@
 //! | `ctrlc-fallback` | no      | 1.x name, now an alias of `agnostic`.                                |
 //! | `async-std`      | no      | Deprecated alias of `agnostic`; no longer depends on async-std.     |
 //! | `tracing`        | no      | Structured diagnostics for signals, installs and hooks.              |
-//! | `tokio-util`     | no      | [`ShutdownToken::cancellation_token`] interop.                      |
+//! | `tokio-util`     | no      | `ShutdownToken::cancellation_token` interop.                        |
 //!
 //! Waiting ([`ShutdownToken::wait`]), subscriptions and
 //! [`Coordinator::run_hooks_async`] are runtime-agnostic in every
@@ -81,7 +81,10 @@
 // One FFI call (the Windows console handler of the `agnostic` back-end)
 // opts out locally, with a `SAFETY:` justification; nothing else may.
 #![deny(unsafe_code)]
-#![deny(warnings)]
+// REPS requires `deny(warnings)`. It is lifted for docs.rs only, which
+// builds the published crate once with that day's nightly: a lint added
+// later must not leave a release without documentation.
+#![cfg_attr(not(docsrs), deny(warnings))]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]
@@ -122,7 +125,7 @@ mod loom_tests;
 pub use crate::coord::{Coordinator, CoordinatorBuilder, Statistics};
 pub use crate::dispatch::{Recv, SignalSubscription};
 pub use crate::error::{Error, Result};
-pub use crate::hook::{FnHook, ShutdownHook, hook_from_fn};
+pub use crate::hook::{FnHook, HookContext, ShutdownHook, hook_from_fn};
 pub use crate::install::Backend;
 pub use crate::reason::ShutdownReason;
 pub use crate::report::{HookOutcome, HookPhase, HookStatus, RunReport};

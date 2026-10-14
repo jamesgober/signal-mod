@@ -53,12 +53,25 @@ fn scenarios() -> Vec<Scenario> {
     v.push(("unix_agnostic_delivers_every_signal", unix::expect_ok));
     #[cfg(any(feature = "tokio", feature = "agnostic"))]
     {
-        v.push(("unix_second_sigint_exits_130", unix::expect_exit_130));
+        v.push((
+            "unix_second_sigint_reraises_sigint",
+            unix::expect_killed_by_sigint,
+        ));
         v.push((
             "unix_uninstall_restores_default_sigterm",
             unix::expect_killed_by_sigterm,
         ));
         v.push(("unix_pipe_stays_ignored_after_uninstall", unix::expect_ok));
+        // SM2-004: only a disposition signal-mod replaced is restored.
+        v.push((
+            "unix_foreign_handler_keeps_signal_after_uninstall",
+            unix::expect_ok,
+        ));
+        v.push((
+            "unix_ignored_signal_stays_ignored_after_uninstall",
+            unix::expect_ok,
+        ));
+        v.push(("unix_notify_signal_is_not_restored", unix::expect_ok));
     }
     v
 }
@@ -78,6 +91,13 @@ fn scenarios() -> Vec<Scenario> {
     v.push((
         "windows_second_ctrl_break_exits_131",
         windows::ctrl_break_twice,
+    ));
+    // SM2-005: a Tokio-installed and an agnostic-installed coordinator
+    // both receive the event.
+    #[cfg(all(feature = "tokio", feature = "agnostic"))]
+    v.push((
+        "windows_mixed_backends_both_receive",
+        windows::ctrl_break_once,
     ));
     v
 }
@@ -217,9 +237,12 @@ mod unix {
         }
     }
 
-    pub(crate) fn expect_exit_130(name: &str) -> Outcome {
+    /// Escalation re-raises the signal, so the child dies by SIGINT
+    /// rather than exiting with 130.
+    pub(crate) fn expect_killed_by_sigint(name: &str) -> Outcome {
+        let sigint = signal_mod::Signal::Interrupt.unix_number();
         match run(name) {
-            Ok((status, out)) if status.code() == Some(130) && out.contains("INITIATED") => {
+            Ok((status, out)) if status.signal() == sigint && out.contains("INITIATED") => {
                 Outcome::Pass
             }
             Ok((status, out)) => Outcome::Fail(format!("status {status:?}, output: {out}")),
@@ -320,11 +343,23 @@ mod child {
                 unix_delivers_every_signal(signal_mod::Backend::Agnostic);
             }
             #[cfg(unix)]
-            "unix_second_sigint_exits_130" => in_any_backend(unix_second_sigint),
+            "unix_second_sigint_reraises_sigint" => in_any_backend(unix_second_sigint),
             #[cfg(unix)]
             "unix_uninstall_restores_default_sigterm" => in_any_backend(unix_restore_default),
             #[cfg(unix)]
             "unix_pipe_stays_ignored_after_uninstall" => in_any_backend(unix_pipe_ignored),
+            #[cfg(unix)]
+            "unix_foreign_handler_keeps_signal_after_uninstall" => {
+                in_any_backend(unix_foreign_handler_kept);
+            }
+            #[cfg(unix)]
+            "unix_ignored_signal_stays_ignored_after_uninstall" => {
+                in_any_backend(unix_ignored_signal_kept);
+            }
+            #[cfg(unix)]
+            "unix_notify_signal_is_not_restored" => in_any_backend(unix_notify_not_restored),
+            #[cfg(all(windows, feature = "tokio", feature = "agnostic"))]
+            "windows_mixed_backends_both_receive" => windows_mixed_backends(),
             #[cfg(all(windows, feature = "tokio"))]
             "windows_tokio_ctrl_break_is_quit" => with_tokio(|| windows_wait_for_quit(false)),
             #[cfg(all(windows, feature = "agnostic"))]
@@ -451,6 +486,96 @@ mod child {
         raise(Signal::Pipe);
         std::thread::sleep(Duration::from_millis(200));
         say("CHILD-OK");
+        std::process::exit(0);
+    }
+
+    /// A handler registered by other code before signal-mod must keep
+    /// working after the coordinator is gone (1.0 audit follow-up SM2-004:
+    /// the process used to be killed).
+    #[cfg(unix)]
+    fn unix_foreign_handler_kept() {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let number = Signal::User1
+            .unix_number()
+            .unwrap_or_else(|| fail("no number"));
+        if let Err(e) = signal_hook::flag::register(number, std::sync::Arc::clone(&seen)) {
+            fail(&format!("foreign register: {e}"));
+        }
+        let coord = installed(Coordinator::builder().signals(SignalSet::from(Signal::User1)));
+        drop(coord);
+        raise(Signal::User1);
+        std::thread::sleep(Duration::from_millis(200));
+        if !seen.load(std::sync::atomic::Ordering::SeqCst) {
+            fail("foreign handler did not run");
+        }
+        say("CHILD-OK");
+        std::process::exit(0);
+    }
+
+    /// A signal ignored before signal-mod (as under `nohup`) stays
+    /// ignored after the coordinator is gone.
+    #[cfg(unix)]
+    fn unix_ignored_signal_kept() {
+        let number = Signal::Hangup
+            .unix_number()
+            .unwrap_or_else(|| fail("no number"));
+        // SAFETY: setting SIGHUP to SIG_IGN installs no handler code; the
+        // child is single-purpose and nothing else touches SIGHUP yet.
+        let previous = unsafe { libc::signal(number, libc::SIG_IGN) };
+        if previous == libc::SIG_ERR {
+            fail("could not ignore SIGHUP");
+        }
+        let coord = installed(Coordinator::builder().signals(SignalSet::from(Signal::Hangup)));
+        drop(coord);
+        raise(Signal::Hangup);
+        std::thread::sleep(Duration::from_millis(200));
+        say("CHILD-OK");
+        std::process::exit(0);
+    }
+
+    /// Notify-only signals are never restored to their default action.
+    #[cfg(unix)]
+    fn unix_notify_not_restored() {
+        let coord = installed(
+            Coordinator::builder()
+                .signals(SignalSet::empty())
+                .notify_signals(SignalSet::from(Signal::User2)),
+        );
+        drop(coord);
+        raise(Signal::User2);
+        std::thread::sleep(Duration::from_millis(200));
+        say("CHILD-OK");
+        std::process::exit(0);
+    }
+
+    /// One coordinator installed through each back-end; both must see
+    /// the `CTRL_BREAK`.
+    #[cfg(all(windows, feature = "tokio", feature = "agnostic"))]
+    fn windows_mixed_backends() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let tokio_coord = {
+            let _guard = rt.enter();
+            installed(Coordinator::builder().signals(SignalSet::standard()))
+        };
+        let agnostic_coord = installed(Coordinator::builder().signals(SignalSet::standard()));
+        if tokio_coord.backend() != Some(signal_mod::Backend::Tokio)
+            || agnostic_coord.backend() != Some(signal_mod::Backend::Agnostic)
+        {
+            fail("unexpected back-ends");
+        }
+        say("READY");
+        for coord in [&tokio_coord, &agnostic_coord] {
+            if !coord.token().wait_blocking_timeout(WAIT) {
+                fail(&format!("{:?} coordinator saw nothing", coord.backend()));
+            }
+            if coord.token().reason() != Some(ShutdownReason::Signal(Signal::Quit)) {
+                fail(&format!("reason {:?}", coord.token().reason()));
+            }
+        }
         std::process::exit(0);
     }
 
