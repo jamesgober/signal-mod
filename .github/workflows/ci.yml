@@ -2,15 +2,16 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feature/**", "fix/**"]
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
-  # Every job pins its toolchain here; RUSTUP_TOOLCHAIN overrides
+  # Lints are deny-by-default, so the lint toolchain is pinned (and
+  # bumped deliberately, together with rust-toolchain.toml) instead of
+  # floating with every stable release. RUSTUP_TOOLCHAIN overrides
   # rust-toolchain.toml.
-  RUSTUP_TOOLCHAIN: stable
+  RUSTUP_TOOLCHAIN: "1.99.0"
 
 jobs:
   fmt:
@@ -18,8 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.0"
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -41,8 +43,9 @@ jobs:
         name: [default, all-features, no-default-features]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -66,8 +69,9 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy and test every feature on its own
@@ -94,8 +98,9 @@ jobs:
           - i686-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.0"
           components: clippy
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
@@ -129,7 +134,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
       - uses: Swatinem/rust-cache@v2
       - name: rustdoc (stable, all features)
         run: cargo doc --locked --all-features --no-deps
@@ -147,7 +154,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
       - uses: Swatinem/rust-cache@v2
       - name: Loom
         run: cargo test --lib --release --no-default-features --features std loom
@@ -178,6 +187,9 @@ jobs:
   semver:
     name: SemVer (cargo-semver-checks)
     runs-on: ubuntu-latest
+    # The action installs and uses its own (current stable) toolchain.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
       - uses: obi1kenobi/cargo-semver-checks-action@v2
@@ -187,7 +199,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny

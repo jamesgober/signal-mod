@@ -4,10 +4,10 @@
 # needs 1.86, and cargo-semver-checks needs a recent stable. The MSRV is
 # enforced separately (`cargo +1.85 check`, and the CI `msrv` job).
 #
-# CI does not inherit this pin: every job sets RUSTUP_TOOLCHAIN, which
-# takes precedence over this file, so the stable jobs run current stable
-# and the MSRV job runs 1.85.
+# CI uses the same pinned toolchain for linting and tests (bump both
+# together, deliberately, since lints are deny-by-default); its MSRV job
+# runs 1.85 and its docs.rs / sanitizer jobs run nightly.
 [toolchain]
-channel = "1.95.0"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
