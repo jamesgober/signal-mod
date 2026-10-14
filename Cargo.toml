@@ -75,11 +75,11 @@ default = ["std", "tokio"]
 std = []
 
 # Tokio back-end. `Coordinator::install` called inside a Tokio runtime
-# spawns one listener task per signal via `tokio::signal` on Unix, where
-# `signal-hook` restores a default disposition after uninstall. On
-# Windows it shares the console control handler (windows-sys) with the
-# agnostic back-end, so coordinators of both kinds see every event.
-tokio = ["dep:tokio", "dep:signal-hook", "dep:windows-sys"]
+# spawns one listener task per signal via `tokio::signal`. On Unix,
+# `signal-hook` restores a default disposition after uninstall. With this
+# feature the agnostic back-end also uses Tokio's console-event streams
+# on Windows, so every listener in the process shares one handler.
+tokio = ["dep:tokio", "dep:signal-hook"]
 
 # Runtime-agnostic back-end. Signals feed the runtime-agnostic
 # `ShutdownToken::wait` future, so it works under smol, async-std, any
@@ -130,9 +130,10 @@ libc = "0.2.155"
 signal-hook = { version = "0.4", optional = true, default-features = false, features = ["iterator"] }
 
 [target.'cfg(windows)'.dependencies]
-# Optional (features `tokio`, `agnostic`). `SetConsoleCtrlHandler`, the
-# one FFI call the back-ends need on Windows. Already in every Tokio build
-# on Windows.
+# Optional (feature `agnostic`). `SetConsoleCtrlHandler`, for the
+# agnostic back-end's own console handler when the `tokio` feature (and
+# with it Tokio's shared handler) is not enabled. Already in every Tokio
+# build on Windows.
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_System_Console"] }
 
 [dev-dependencies]

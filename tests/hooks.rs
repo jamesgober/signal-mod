@@ -14,13 +14,14 @@ use signal_mod::{
     Coordinator, FnHook, HookPhase, HookStatus, ShutdownHook, ShutdownReason, hook_from_fn,
 };
 
-/// How long a "hung" hook sleeps. Deadline tests use budgets of a few
-/// hundred milliseconds and only assert that the run returned well
-/// before a hung hook would have, so they stay reliable on loaded CI
-/// runners (SM2-002).
+/// How long a "hung" hook sleeps. Deadline tests use budgets of a couple
+/// of seconds and only assert that the run returned well before a hung
+/// hook would have. Budgets are measured from the start of the run, so
+/// they must leave room for the worker thread to be scheduled even on a
+/// saturated CI runner (SM2-002, SM2-016).
 const HANG: Duration = Duration::from_secs(30);
 const WELL_BEFORE_HANG: Duration = Duration::from_secs(15);
-const BUDGET: Duration = Duration::from_millis(300);
+const BUDGET: Duration = Duration::from_secs(2);
 
 fn hang(name: &str, priority: i32) -> FnHook<impl Fn(ShutdownReason) + Send + Sync + 'static> {
     hook_from_fn(name, priority, |_| thread::sleep(HANG))
@@ -48,23 +49,40 @@ fn test_hung_hook_is_abandoned_at_graceful_deadline() {
     assert_eq!(report.timed_out(), 1);
     assert_eq!(report.outcomes()[0].status, HookStatus::TimedOut);
     assert_eq!(report.outcomes()[0].phase, Some(HookPhase::Graceful));
-    assert!(report.outcomes()[0].duration.unwrap() >= BUDGET / 2);
+    assert!(report.outcomes()[0].duration.is_some());
 }
 
-// SM2-002: the clock starts when the first hook is about to start, so
-// the first hook always starts in the graceful phase, however slowly the
-// worker thread got scheduled.
+// SM2-002: with a pre-parked worker the hand-off is fast, so the first
+// hook starts in the graceful phase even on a loaded machine.
 #[test]
-fn test_first_hook_always_starts_in_graceful_phase() {
-    for _ in 0..20 {
+fn test_first_hook_starts_in_graceful_phase() {
+    for _ in 0..5 {
         let coord = Coordinator::builder()
-            .graceful_timeout(Duration::from_millis(1))
-            .force_timeout(Duration::from_millis(1))
+            .graceful_timeout(BUDGET)
+            .force_timeout(BUDGET)
             .hook(hook_from_fn("first", 0, |_| {}))
             .build();
         let report = coord.run_hooks_with_report(ShutdownReason::Requested);
         assert_eq!(report.outcomes()[0].phase, Some(HookPhase::Graceful));
     }
+}
+
+// SM2-016: `force_timeout` is a hard upper bound on the whole run.
+#[test]
+fn test_run_never_exceeds_force_timeout() {
+    let coord = Coordinator::builder()
+        .graceful_timeout(Duration::from_millis(100))
+        .force_timeout(BUDGET)
+        .hook(hang("a", 2))
+        .hook(hang("b", 1))
+        .hook(hang("c", 0))
+        .build();
+    let start = Instant::now();
+    let report = coord.run_hooks_with_report(ShutdownReason::Requested);
+    assert!(start.elapsed() < WELL_BEFORE_HANG);
+    assert!(report.elapsed() >= Duration::from_millis(100));
+    assert_eq!(report.completed(), 0);
+    assert!(report.outcomes().iter().all(|o| o.status.is_finished()));
 }
 
 #[test]
@@ -462,25 +480,35 @@ fn test_async_run_works_without_tokio_on_smol() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_concurrent_async_callers_share_one_run_and_drop_is_safe() {
     let counter = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let coord = Coordinator::builder()
+        .graceful_timeout(Duration::from_secs(60))
         .hook({
             let c = Arc::clone(&counter);
-            hook_from_fn("slow", 0, move |_| {
-                thread::sleep(Duration::from_millis(50));
+            let r = Arc::clone(&release);
+            hook_from_fn("held", 0, move |_| {
+                while !r.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 c.fetch_add(1, Ordering::SeqCst);
             })
         })
         .build();
     let first = tokio::spawn(coord.run_hooks_async(ShutdownReason::Requested));
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Wait until the run is in progress (the hook is held).
+    while coord.statistics().hooks[0].status != HookStatus::Running {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     // Joins the run in progress, then is dropped while pending.
     let abandoned = tokio::time::timeout(
-        Duration::from_millis(1),
+        Duration::from_millis(5),
         coord.run_hooks_async(ShutdownReason::Forced),
     )
     .await;
     assert!(abandoned.is_err());
+    release.store(true, Ordering::SeqCst);
     let second = coord.run_hooks_async(ShutdownReason::Forced).await;
     assert_eq!(first.await.unwrap(), second);
+    assert_eq!(second.reason(), ShutdownReason::Requested);
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }

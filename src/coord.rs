@@ -273,19 +273,22 @@ impl Coordinator {
     ///   within a priority), each on a worker thread. With the `tokio`
     ///   feature, a Tokio runtime current on the calling thread is
     ///   entered on the worker thread.
+    /// - Both budgets are measured from the moment this call starts the
+    ///   run; handing the hooks to the worker thread counts against them.
     /// - **Graceful phase:** hooks start with `reason` until
     ///   [`graceful_timeout`](CoordinatorBuilder::graceful_timeout) has
-    ///   elapsed since the run began.
+    ///   elapsed.
     /// - **Force phase:** hooks not started by then start with
     ///   [`ShutdownReason::Forced`] until
     ///   [`force_timeout`](CoordinatorBuilder::force_timeout) has
-    ///   elapsed since the run began. Later hooks are `Skipped`.
+    ///   elapsed. Later hooks are `Skipped`.
     /// - A hook still running when its own
     ///   [`timeout`](ShutdownHook::timeout) or its phase's deadline
     ///   passes is reported `TimedOut` and abandoned (its thread keeps
-    ///   running it); the run moves on. The call therefore returns
-    ///   within the force budget plus scheduling noise, whatever the
-    ///   hooks do.
+    ///   running it); the run moves on. If a worker thread does not
+    ///   start (for example a standby thread lost to `fork`), another
+    ///   one is started. The call returns within `force_timeout` plus
+    ///   scheduling noise, whatever the hooks or threads do.
     /// - A panicking hook is reported `Panicked` with its message and
     ///   does not stop the run.
     /// - **Run-once:** the first call runs the hooks. Every other call,
@@ -305,7 +308,7 @@ impl Coordinator {
     /// use std::time::Duration;
     ///
     /// let coord = Coordinator::builder()
-    ///     .graceful_timeout(Duration::from_millis(200))
+    ///     .graceful_timeout(Duration::from_secs(2))
     ///     .force_timeout(Duration::from_secs(20))
     ///     .hook(hook_from_fn("hangs", 10, |_| std::thread::sleep(Duration::from_secs(30))))
     ///     .hook(hook_from_fn("flush", 0, |_| {}))
@@ -366,15 +369,22 @@ impl Coordinator {
     ///
     /// 1. `tokio` enabled and a Tokio runtime current: Tokio listener
     ///    tasks ([`Backend::Tokio`]).
-    /// 2. otherwise, `agnostic` enabled: a listener thread on Unix, the
-    ///    console control handler on Windows ([`Backend::Agnostic`]).
+    /// 2. otherwise, `agnostic` enabled: a listener thread
+    ///    ([`Backend::Agnostic`]); on Windows without the `tokio` feature,
+    ///    signal-mod's own console control handler instead.
     /// 3. otherwise: [`Error::OutsideTokioRuntime`] (only `tokio`
     ///    enabled) or [`Error::NoRuntime`] (no back-end enabled).
     ///
     /// Installation is all-or-nothing. Several coordinators may be
     /// installed in one process, with either back-end; every one of them
-    /// receives the signals it listens for (on Windows both back-ends
-    /// share one console control handler for that reason).
+    /// receives the signals it listens for. On Windows with the `tokio`
+    /// feature, both back-ends go through Tokio's console handler, which
+    /// also serves the application's own `tokio::signal` listeners. Without
+    /// the `tokio` feature, the agnostic back-end registers its own console
+    /// handler; Windows calls console handlers last-registered first and
+    /// stops at the first that claims an event, so a console handler
+    /// registered earlier by other code (including the application's own
+    /// Tokio, if it uses one) no longer sees the events signal-mod covers.
     ///
     /// Listeners stay installed until [`uninstall`](Self::uninstall) or
     /// until the coordinator is dropped. What happens to a signal after
@@ -590,9 +600,10 @@ impl CoordinatorBuilder {
         self
     }
 
-    /// Graceful budget for running hooks, measured from the start of the
-    /// run. Hooks that start within it receive the caller's reason; it
-    /// is enforced (a hook still running at the deadline is abandoned).
+    /// Graceful budget for running hooks, measured from the moment the
+    /// `run_hooks*` call starts the run. Hooks that start within it
+    /// receive the caller's reason; it is enforced (a hook still running
+    /// at the deadline is abandoned).
     ///
     /// On Windows, the OS kills a console process about 5 seconds after
     /// `CTRL_CLOSE_EVENT`; if console close matters, keep the budget
@@ -604,10 +615,11 @@ impl CoordinatorBuilder {
         self
     }
 
-    /// Total budget for running hooks, measured from the start of the
-    /// run. Hooks not started when the graceful budget runs out start in
-    /// the force phase, with [`ShutdownReason::Forced`], until this
-    /// budget runs out; the rest are skipped. A value not above
+    /// Total budget for running hooks, measured from the moment the
+    /// `run_hooks*` call starts the run, and a hard upper bound on it.
+    /// Hooks not started when the graceful budget runs out start in the
+    /// force phase, with [`ShutdownReason::Forced`], until this budget
+    /// runs out; the rest are skipped. A value not above
     /// [`graceful_timeout`](Self::graceful_timeout) disables the force
     /// phase.
     #[must_use]
@@ -642,6 +654,15 @@ impl CoordinatorBuilder {
     }
 
     /// Finalize into a [`Coordinator`]. Sorts the hooks once.
+    ///
+    /// If any hook is registered, this starts one parked worker thread
+    /// (named `signal-mod-hook`) so that running the hooks later does not
+    /// pay for a thread spawn; it uses no CPU and exits when the
+    /// coordinator is dropped or after the hooks have run. A process
+    /// that `fork`s after `build()` does not inherit the thread: the run
+    /// in the child detects that and starts a fresh worker. Programs
+    /// that daemonize should still build the coordinator after forking,
+    /// as with any multi-threaded set-up.
     #[must_use]
     pub fn build(self) -> Coordinator {
         let inner = Inner::new();

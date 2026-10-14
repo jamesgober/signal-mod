@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
-use signal_mod::{Coordinator, ShutdownReason, Signal, SignalSet, hook_from_fn};
+use signal_mod::{
+    Coordinator, CoordinatorBuilder, ShutdownReason, Signal, SignalSet, hook_from_fn,
+};
 
 fn bench_token_is_initiated(c: &mut Criterion) {
     let coord = Coordinator::builder().build();
@@ -123,6 +125,28 @@ fn bench_run_hooks(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_build(c: &mut Criterion) {
+    let mut group = c.benchmark_group("build");
+    group.bench_function("no hooks", |b| {
+        b.iter(|| Coordinator::builder().build());
+    });
+    // With hooks, `build()` also starts the parked standby worker thread.
+    group.bench_function("16 hooks", |b| {
+        b.iter_batched(
+            || {
+                let mut builder = Coordinator::builder();
+                for i in 0..16 {
+                    builder = builder.hook(hook_from_fn(format!("hook-{i}"), i, |_| {}));
+                }
+                builder
+            },
+            CoordinatorBuilder::build,
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 fn bench_statistics(c: &mut Criterion) {
     let mut builder = Coordinator::builder();
     for i in 0..16 {
@@ -178,6 +202,7 @@ criterion_group!(
     bench_clone_token,
     bench_wait_future_ready,
     bench_run_hooks,
+    bench_build,
     bench_statistics,
     bench_signal_set_iter,
     bench_subscription_delivery,

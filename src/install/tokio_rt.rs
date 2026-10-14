@@ -6,16 +6,16 @@
 //!   earlier listeners running). Uninstalling aborts the tasks; because
 //!   Tokio never removes its OS handler, [`restore`](super::restore)
 //!   brings back the default action where that was the prior one.
-//! - **Windows:** the shared console control handler in
-//!   [`console`](super::console). A Tokio-installed and an
-//!   agnostic-installed coordinator in one process therefore both see
-//!   every event (with separate handlers, Windows would stop at the
-//!   first one that claims the event).
+//! - **Windows:** one `tokio::signal::windows` listener task per console
+//!   event. Tokio's console handler broadcasts each event to every Tokio
+//!   listener in the process, so coordinators and the application's own
+//!   `tokio::signal` listeners all see it. Uninstalling drops the
+//!   streams; once nothing listens, Tokio's handler declines the event
+//!   and the OS default (terminate) applies.
 
 use std::sync::Arc;
 
 use tokio::runtime::Handle;
-#[cfg(not(windows))]
 use tokio::task::JoinHandle;
 
 use crate::dispatch::Dispatcher;
@@ -25,10 +25,7 @@ use crate::signal::SignalSet;
 /// Running listener tasks.
 #[derive(Debug)]
 pub(crate) struct Registration {
-    #[cfg(not(windows))]
     tasks: Vec<JoinHandle<()>>,
-    #[cfg(windows)]
-    console: u64,
     covered: SignalSet,
     /// Signals counted by [`restore::acquire`](super::restore::acquire).
     #[cfg(unix)]
@@ -41,12 +38,9 @@ impl Registration {
     }
 
     pub(crate) fn uninstall(self) {
-        #[cfg(not(windows))]
         for task in &self.tasks {
             task.abort();
         }
-        #[cfg(windows)]
-        super::console::unregister(self.console);
         #[cfg(unix)]
         super::restore::release(self.restored);
         sm_debug!(signals = ?self.covered, "tokio signal listeners removed");
@@ -108,17 +102,24 @@ pub(crate) fn install(
 
 #[cfg(windows)]
 pub(crate) fn install(
-    _handle: &Handle,
+    handle: &Handle,
     dispatcher: &Arc<Dispatcher>,
     set: SignalSet,
 ) -> Result<Registration> {
     let covered = set.available_on_current_platform();
-    // One OS call covers every event, so a failure is not attributable to
-    // a single signal.
-    let console = super::console::register(dispatcher, covered)
-        .map_err(crate::error::Error::ListenerThread)?;
-    sm_debug!(signals = ?covered, "console control handler registered (tokio back-end)");
-    Ok(Registration { console, covered })
+    let tasks = super::windows_events::streams(covered)?
+        .into_iter()
+        .map(|(sig, mut stream)| {
+            let dispatcher = Arc::clone(dispatcher);
+            handle.spawn(async move {
+                while stream.recv().await.is_some() {
+                    dispatcher.deliver(sig);
+                }
+            })
+        })
+        .collect();
+    sm_debug!(signals = ?covered, "tokio console-event listeners installed");
+    Ok(Registration { tasks, covered })
 }
 
 #[cfg(not(any(unix, windows)))]

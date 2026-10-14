@@ -8,10 +8,14 @@
 //!   is registered individually, so a failure names the signal that
 //!   failed (1.0.0's async-std back-end blamed the first signal in the
 //!   set).
-//! - **Windows:** the process-wide console control handler in
-//!   [`console`](super::console), shared with the Tokio back-end. The OS
-//!   calls it on a fresh thread per event, so no listener thread is
-//!   needed.
+//! - **Windows, with the `tokio` feature:** a listener thread polls
+//!   Tokio's console-event streams without a runtime. Every coordinator
+//!   (either back-end) and the application's own `tokio::signal`
+//!   listeners then share Tokio's one console handler and all see each
+//!   event.
+//! - **Windows, without the `tokio` feature:** signal-mod's own console
+//!   control handler ([`console`](super::console)). The OS calls it on a
+//!   fresh thread per event, so no listener thread is needed.
 
 use std::sync::Arc;
 
@@ -112,18 +116,18 @@ pub(crate) fn install(dispatcher: &Arc<Dispatcher>, set: SignalSet) -> Result<Re
 
 // ------------------------------------------------------------- Windows
 
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "tokio")))]
 #[derive(Debug)]
 struct Stop(u64);
 
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "tokio")))]
 impl Stop {
     fn stop(&self) {
         super::console::unregister(self.0);
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "tokio")))]
 pub(crate) fn install(dispatcher: &Arc<Dispatcher>, set: SignalSet) -> Result<Registration> {
     let covered = set.available_on_current_platform();
     // One OS call covers every event, so a failure is not attributable to
@@ -133,6 +137,74 @@ pub(crate) fn install(dispatcher: &Arc<Dispatcher>, set: SignalSet) -> Result<Re
     sm_debug!(signals = ?covered, "console control handler registered");
     Ok(Registration {
         stop: Stop(id),
+        covered,
+    })
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+#[derive(Debug)]
+struct Stop {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::Thread,
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+impl Stop {
+    fn stop(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Release);
+        self.thread.unpark();
+    }
+}
+
+/// Wakes the listener thread when a stream has an event.
+#[cfg(all(windows, feature = "tokio"))]
+struct Unparker(std::thread::Thread);
+
+#[cfg(all(windows, feature = "tokio"))]
+impl std::task::Wake for Unparker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+#[cfg(all(windows, feature = "tokio"))]
+pub(crate) fn install(dispatcher: &Arc<Dispatcher>, set: SignalSet) -> Result<Registration> {
+    use core::task::{Context, Poll};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let covered = set.available_on_current_platform();
+    // Created here so a registration error is returned from `install`.
+    let mut streams = super::windows_events::streams(covered)?;
+    let flag = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&flag);
+    let listener = Arc::clone(dispatcher);
+    let thread = std::thread::Builder::new()
+        .name("signal-mod-signals".into())
+        .spawn(move || {
+            let waker = std::task::Waker::from(Arc::new(Unparker(std::thread::current())));
+            let mut cx = Context::from_waker(&waker);
+            while !stop_flag.load(Ordering::Acquire) {
+                for (sig, stream) in &mut streams {
+                    while let Poll::Ready(Some(())) = stream.poll_recv(&mut cx) {
+                        listener.deliver(*sig);
+                    }
+                }
+                std::thread::park();
+            }
+            // Dropping the streams here tells Tokio nobody listens any
+            // more for this coordinator.
+        })
+        .map_err(crate::error::Error::ListenerThread)?;
+    sm_debug!(signals = ?covered, "console-event listener thread started (tokio streams)");
+    Ok(Registration {
+        stop: Stop {
+            flag,
+            thread: thread.thread().clone(),
+        },
         covered,
     })
 }
@@ -159,7 +231,7 @@ pub(crate) fn install(_dispatcher: &Arc<Dispatcher>, _set: SignalSet) -> Result<
     })
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, windows, not(feature = "tokio")))]
 mod tests {
     use super::*;
     use crate::reason::ShutdownReason;

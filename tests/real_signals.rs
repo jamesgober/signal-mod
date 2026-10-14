@@ -72,6 +72,9 @@ fn scenarios() -> Vec<Scenario> {
             unix::expect_ok,
         ));
         v.push(("unix_notify_signal_is_not_restored", unix::expect_ok));
+        // SM2-016: a process forked after `build()` still runs its hooks
+        // within the budget.
+        v.push(("unix_fork_after_build_runs_hooks", unix::expect_ok));
     }
     v
 }
@@ -97,6 +100,13 @@ fn scenarios() -> Vec<Scenario> {
     #[cfg(all(feature = "tokio", feature = "agnostic"))]
     v.push((
         "windows_mixed_backends_both_receive",
+        windows::ctrl_break_once,
+    ));
+    // SM2-017: the application's own earlier `tokio::signal` listener
+    // still receives the event next to a coordinator.
+    #[cfg(feature = "tokio")]
+    v.push((
+        "windows_app_tokio_listener_still_receives",
         windows::ctrl_break_once,
     ));
     v
@@ -358,8 +368,12 @@ mod child {
             }
             #[cfg(unix)]
             "unix_notify_signal_is_not_restored" => in_any_backend(unix_notify_not_restored),
+            #[cfg(unix)]
+            "unix_fork_after_build_runs_hooks" => unix_fork_after_build(),
             #[cfg(all(windows, feature = "tokio", feature = "agnostic"))]
             "windows_mixed_backends_both_receive" => windows_mixed_backends(),
+            #[cfg(all(windows, feature = "tokio"))]
+            "windows_app_tokio_listener_still_receives" => windows_app_listener_kept(),
             #[cfg(all(windows, feature = "tokio"))]
             "windows_tokio_ctrl_break_is_quit" => with_tokio(|| windows_wait_for_quit(false)),
             #[cfg(all(windows, feature = "agnostic"))]
@@ -548,6 +562,48 @@ mod child {
         std::process::exit(0);
     }
 
+    /// Daemon pattern: build the coordinator, then `fork`. The standby hook
+    /// worker started by `build()` does not exist in the child; the run
+    /// there must still execute the hooks and end within the budget.
+    #[cfg(unix)]
+    fn unix_fork_after_build() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&ran);
+        let coord = Coordinator::builder()
+            .graceful_timeout(Duration::from_secs(1))
+            .force_timeout(Duration::from_secs(2))
+            .hook(signal_mod::hook_from_fn("flush", 0, move |_| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }))
+            .build();
+        // SAFETY: `fork` has no memory-safety preconditions. The child
+        // only runs the hook sequence and leaves with `_exit`, never
+        // returning into the test harness.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            fail("fork failed");
+        }
+        if pid == 0 {
+            let start = std::time::Instant::now();
+            let report = coord.run_hooks_with_report(ShutdownReason::Requested);
+            let ok = report.completed() == 1
+                && ran.load(std::sync::atomic::Ordering::SeqCst)
+                && start.elapsed() < Duration::from_secs(2) + Duration::from_millis(500);
+            // SAFETY: `_exit` ends the forked child immediately without
+            // running destructors or the parent's atexit handlers.
+            unsafe { libc::_exit(if ok { 0 } else { 3 }) };
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is our own child and `status` is a valid out
+        // pointer for the duration of the call.
+        let waited = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        if waited != pid || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            fail(&format!("forked child failed: status {status}"));
+        }
+        say("CHILD-OK");
+        std::process::exit(0);
+    }
+
     /// One coordinator installed through each back-end; both must see
     /// the `CTRL_BREAK`.
     #[cfg(all(windows, feature = "tokio", feature = "agnostic"))]
@@ -575,6 +631,30 @@ mod child {
             if coord.token().reason() != Some(ShutdownReason::Signal(Signal::Quit)) {
                 fail(&format!("reason {:?}", coord.token().reason()));
             }
+        }
+        std::process::exit(0);
+    }
+
+    /// An application listener registered through Tokio before the
+    /// coordinator keeps receiving events.
+    #[cfg(all(windows, feature = "tokio"))]
+    fn windows_app_listener_kept() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let mut app = tokio::signal::windows::ctrl_break()
+            .unwrap_or_else(|e| fail(&format!("app listener: {e}")));
+        let coord = installed(Coordinator::builder().signals(SignalSet::standard()));
+        say("READY");
+        if !coord.token().wait_blocking_timeout(WAIT) {
+            fail("coordinator saw nothing");
+        }
+        let app_saw = rt.block_on(async { tokio::time::timeout(WAIT, app.recv()).await });
+        if !matches!(app_saw, Ok(Some(()))) {
+            fail("the application's own listener did not receive CTRL_BREAK");
         }
         std::process::exit(0);
     }

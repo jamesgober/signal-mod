@@ -78,8 +78,9 @@
 //! `docs/API.md` in the repository.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
-// One FFI call (the Windows console handler of the `agnostic` back-end)
-// opts out locally, with a `SAFETY:` justification; nothing else may.
+// Two modules opt out locally, each with `SAFETY:` justifications: the
+// Windows console handler registration (`install/console.rs`) and a
+// read-only `sigaction` query on Unix (`install/disposition.rs`).
 #![deny(unsafe_code)]
 // REPS requires `deny(warnings)`. It is lifted for docs.rs only, which
 // builds the published crate once with that day's nightly: a lint added

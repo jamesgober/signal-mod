@@ -6,10 +6,11 @@
 //! so registration order breaks ties). A run walks them in that order:
 //!
 //! 1. **Graceful phase.** Hooks start with the caller's reason until
-//!    `graceful_timeout` (measured from the start of the run) elapses.
+//!    `graceful_timeout` (measured from the moment the run starts)
+//!    elapses.
 //! 2. **Force phase.** Hooks that had not started by then start with
 //!    [`ShutdownReason::Forced`] until `force_timeout` (also measured from
-//!    the start of the run) elapses. With `force_timeout <=
+//!    the moment the run starts) elapses. With `force_timeout <=
 //!    graceful_timeout` there is no force phase.
 //! 3. Hooks still not started when the force budget is gone are
 //!    `Skipped`.
@@ -54,7 +55,7 @@ use core::task::{Context, Poll};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -245,11 +246,10 @@ fn execute(hook: &dyn ShutdownHook, reason: ShutdownReason) -> (HookStatus, Opti
     }
 }
 
-/// Deadlines of one run. The clock starts when the first worker is
-/// about to start the first hook, not when `run_hooks` is called, so
-/// thread start-up and scheduling delay before the first hook never eat
-/// into the graceful budget; the first hook always starts in the graceful
-/// phase (unless that budget is zero).
+/// Deadlines of one run, measured from the moment the run starts (the
+/// `run_hooks*` call that starts it). Everything, including the hand-off
+/// to the worker thread, counts against the budgets, so `force_timeout`
+/// is a hard upper bound on the run.
 #[derive(Clone, Copy)]
 struct Plan {
     reason: ShutdownReason,
@@ -341,19 +341,24 @@ struct Progress {
 }
 
 struct Run {
-    reason: ShutdownReason,
-    graceful: Duration,
-    force: Duration,
-    clock: OnceLock<Plan>,
+    plan: Plan,
     progress: Mutex<Progress>,
     changed: Condvar,
 }
 
-impl Run {
-    /// The run's deadlines, starting the clock on first use.
-    fn plan(&self) -> &Plan {
-        self.clock
-            .get_or_init(|| Plan::starting_now(self.reason, self.graceful, self.force))
+/// How long the supervisor waits for a newly assigned worker to start
+/// its first hook before it assumes the worker is gone (for example a
+/// standby thread that did not survive `fork`) and starts another one.
+const HANDOFF_GRACE: Duration = Duration::from_millis(250);
+
+fn wait_opt<'a, T>(
+    cv: &Condvar,
+    guard: MutexGuard<'a, T>,
+    deadline: Option<Instant>,
+) -> MutexGuard<'a, T> {
+    match deadline {
+        Some(deadline) => wait_until(cv, guard, deadline),
+        None => wait(cv, guard),
     }
 }
 
@@ -380,9 +385,11 @@ pub(crate) struct HookRunner {
     state: Mutex<RunState>,
     done: Condvar,
     /// A parked worker thread started at build time, so that running the
-    /// hooks does not pay for a thread spawn. `None` without hooks, once
-    /// used, or if it could not be spawned.
-    standby: Mutex<Option<mpsc::Sender<Assignment>>>,
+    /// hooks does not pay for a thread spawn, with the id of the process
+    /// that started it: after `fork` the thread does not exist in the
+    /// child, so it is only used by the same process. `None` without
+    /// hooks, once used, or if it could not be spawned.
+    standby: Mutex<Option<(u32, mpsc::Sender<Assignment>)>>,
 }
 
 impl fmt::Debug for HookRunner {
@@ -397,7 +404,7 @@ impl fmt::Debug for HookRunner {
 
 /// Start a parked worker that runs one assignment, or exits when the
 /// runner (and with it the sender) is dropped first.
-fn spawn_standby() -> Option<mpsc::Sender<Assignment>> {
+fn spawn_standby() -> Option<(u32, mpsc::Sender<Assignment>)> {
     let (tx, rx) = mpsc::channel::<Assignment>();
     let spawned = thread::Builder::new()
         .name("signal-mod-hook".into())
@@ -408,7 +415,7 @@ fn spawn_standby() -> Option<mpsc::Sender<Assignment>> {
             }
         });
     match spawned {
-        Ok(_detached) => Some(tx),
+        Ok(_detached) => Some((std::process::id(), tx)),
         Err(error) => {
             sm_warn!(error = %error, "could not pre-spawn the hook worker; it will start on demand");
             drop(error);
@@ -487,10 +494,7 @@ impl HookRunner {
         sm_debug!(hooks = self.slots.len(), %reason, "running shutdown hooks");
         if !self.slots.is_empty() {
             let run = Arc::new(Run {
-                reason,
-                graceful: self.graceful,
-                force: self.force,
-                clock: OnceLock::new(),
+                plan: Plan::starting_now(reason, self.graceful, self.force),
                 progress: Mutex::new(Progress {
                     generation: 0,
                     current: None,
@@ -508,8 +512,17 @@ impl HookRunner {
     }
 
     /// The supervisor loop: start a worker, enforce deadlines, replace
-    /// the worker after each timeout, until the list is done.
+    /// the worker after each timeout, until the list is done or the force
+    /// deadline passes.
+    ///
+    /// Every wait is bounded by the force deadline, so the run ends by
+    /// then whatever the hooks or the worker threads do. A worker that
+    /// does not start its first hook within [`HANDOFF_GRACE`] is replaced
+    /// once.
     fn drive(self: &Arc<Self>, run: &Arc<Run>, ctx: &RuntimeContext) {
+        let force_deadline = run.plan.force_deadline;
+        let mut handoff_from = 0;
+        let mut handoff_deadline = Instant::now().checked_add(HANDOFF_GRACE);
         if !self.spawn_worker(run, 0, 0, ctx) {
             return;
         }
@@ -518,51 +531,93 @@ impl HookRunner {
             if progress.finished {
                 return;
             }
-            let Some(current) = progress.current.clone() else {
-                // The worker has not published its first hook yet; it
-                // notifies when it does (we are not sleeping on a
-                // deadline).
-                progress.supervisor_wakes_at = None;
-                progress = wait(&run.changed, progress);
-                continue;
-            };
-            let Some(deadline) = current.control.deadline else {
-                progress.supervisor_wakes_at = None;
-                progress = wait(&run.changed, progress);
-                continue;
-            };
-            if Instant::now() < deadline {
-                progress.supervisor_wakes_at = Some(deadline);
-                progress = wait_until(&run.changed, progress, deadline);
-                continue;
-            }
-            // Deadline passed: time the hook out unless it just finished.
-            let Some(slot) = self.slots.get(current.index) else {
+            let now = Instant::now();
+            if force_deadline.is_some_and(|d| now >= d) {
+                self.end_run(&mut progress, now);
+                run.changed.notify_all();
                 return;
+            }
+            let Some(current) = progress.current.clone() else {
+                // Waiting for the assigned worker to start a hook.
+                if handoff_deadline.is_some_and(|d| now >= d) {
+                    sm_warn!(
+                        "hook worker did not start within the hand-off grace period; starting another"
+                    );
+                    handoff_deadline = None;
+                    progress.generation += 1;
+                    let generation = progress.generation;
+                    drop(progress);
+                    if !self.spawn_worker(run, generation, handoff_from, ctx) {
+                        return;
+                    }
+                    progress = lock(&run.progress);
+                    continue;
+                }
+                let wake = earliest(handoff_deadline, force_deadline);
+                progress.supervisor_wakes_at = wake;
+                progress = wait_opt(&run.changed, progress, wake);
+                continue;
             };
-            let ran_for = deadline.saturating_duration_since(current.started);
-            if slot.try_finish(HookStatus::TimedOut, ran_for, None) {
-                current.control.abandoned.store(true, Ordering::Release);
-                sm_warn!(hook = %slot.name, "shutdown hook timed out; abandoning it");
-                progress.generation += 1;
-                progress.current = None;
-                let generation = progress.generation;
-                drop(progress);
-                if !self.spawn_worker(run, generation, current.index + 1, ctx) {
-                    return;
+            match current.control.deadline {
+                Some(deadline) if now >= deadline => {
+                    let Some(slot) = self.slots.get(current.index) else {
+                        return;
+                    };
+                    let ran_for = deadline.saturating_duration_since(current.started);
+                    if slot.try_finish(HookStatus::TimedOut, ran_for, None) {
+                        current.control.abandoned.store(true, Ordering::Release);
+                        sm_warn!(hook = %slot.name, "shutdown hook timed out; abandoning it");
+                        progress.generation += 1;
+                        progress.current = None;
+                        let generation = progress.generation;
+                        drop(progress);
+                        handoff_from = current.index + 1;
+                        handoff_deadline = Instant::now().checked_add(HANDOFF_GRACE);
+                        if !self.spawn_worker(run, generation, handoff_from, ctx) {
+                            return;
+                        }
+                        progress = lock(&run.progress);
+                    } else {
+                        // The worker finished it in the meantime and is
+                        // moving on; it notifies when it starts the next
+                        // hook with a deadline before ours, or finishes.
+                        progress.supervisor_wakes_at = force_deadline;
+                        if progress
+                            .current
+                            .as_ref()
+                            .is_some_and(|c| c.index == current.index)
+                        {
+                            progress = wait_opt(&run.changed, progress, force_deadline);
+                        }
+                    }
                 }
-                progress = lock(&run.progress);
-            } else {
-                // The worker finished it in the meantime and moved on (or
-                // is about to publish the next hook).
-                progress.supervisor_wakes_at = None;
-                if progress
-                    .current
-                    .as_ref()
-                    .is_some_and(|c| c.index == current.index)
-                {
-                    progress = wait(&run.changed, progress);
+                deadline => {
+                    let wake = earliest(deadline, force_deadline);
+                    progress.supervisor_wakes_at = wake;
+                    progress = wait_opt(&run.changed, progress, wake);
                 }
+            }
+        }
+    }
+
+    /// The force deadline passed: time out the running hook, skip every
+    /// hook not started, and retire the worker so it touches nothing more.
+    fn end_run(&self, progress: &mut Progress, now: Instant) {
+        if let Some(current) = progress.current.take() {
+            if let Some(slot) = self.slots.get(current.index) {
+                let ran_for = now.saturating_duration_since(current.started);
+                if slot.try_finish(HookStatus::TimedOut, ran_for, None) {
+                    current.control.abandoned.store(true, Ordering::Release);
+                    sm_warn!(hook = %slot.name, "shutdown hook timed out at the force deadline");
+                }
+            }
+        }
+        progress.generation += 1;
+        progress.finished = true;
+        for slot in &*self.slots {
+            if slot.raw_status() == HookStatus::Pending.to_u8() {
+                sm_warn!(hook = %slot.name, "shutdown hook skipped: force budget exhausted");
+                slot.mark_skipped();
             }
         }
     }
@@ -582,7 +637,10 @@ impl HookRunner {
             lock(&run.progress).finished = true;
             return false;
         }
-        if let Some(standby) = lock(&self.standby).take() {
+        let standby = lock(&self.standby)
+            .take()
+            .filter(|(pid, _)| *pid == std::process::id());
+        if let Some((_, standby)) = standby {
             let assignment = Assignment {
                 runner: Arc::clone(self),
                 run: Arc::clone(run),
@@ -618,11 +676,8 @@ impl HookRunner {
     /// Worker body: run hooks `from..` while `generation` is current.
     fn work(&self, run: &Run, generation: u64, from: usize) {
         for (index, slot) in self.slots.iter().enumerate().skip(from) {
-            // Start the clock (first hook only) before reading the time,
-            // so a zero budget really is zero.
-            let plan = *run.plan();
             let started = Instant::now();
-            let Some((phase, phase_deadline, reason)) = plan.at(started) else {
+            let Some((phase, phase_deadline, reason)) = run.plan.at(started) else {
                 self.skip_rest(run, generation, index);
                 return;
             };
@@ -859,8 +914,8 @@ mod tests {
                 })),
                 Box::new(hook_from_fn("late", 0, |_| {})),
             ],
-            30,
-            10,
+            2_000,
+            1_000,
         );
         let report = r.run_blocking(ShutdownReason::Requested, &RuntimeContext::default());
         assert_eq!(report.timed_out(), 1);
@@ -892,6 +947,62 @@ mod tests {
         );
         assert_eq!(report.completed(), 1);
         assert_eq!(report.timed_out(), 1);
+    }
+
+    /// A standby worker that never runs, as after `fork` in the child.
+    fn with_dead_standby(r: &HookRunner) {
+        let (tx, rx) = mpsc::channel::<Assignment>();
+        core::mem::forget(rx);
+        *lock(&r.standby) = Some((std::process::id(), tx));
+    }
+
+    // SM2-016: a standby worker that never picks up its assignment must
+    // not hang the run: it is replaced after the hand-off grace period.
+    #[test]
+    fn test_dead_standby_worker_is_replaced_and_hooks_run() {
+        let r = runner(vec![Box::new(hook_from_fn("h", 0, |_| {}))], 5_000, 10_000);
+        with_dead_standby(&r);
+        let start = Instant::now();
+        let report = r.run_blocking(ShutdownReason::Requested, &RuntimeContext::default());
+        assert_eq!(report.completed(), 1);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    // SM2-016: the force deadline bounds the run even if no worker ever
+    // starts a hook.
+    #[test]
+    fn test_force_deadline_bounds_run_when_no_worker_starts() {
+        let r = runner(vec![Box::new(hook_from_fn("h", 0, |_| {}))], 50, 100);
+        with_dead_standby(&r);
+        let start = Instant::now();
+        let report = r.run_blocking(ShutdownReason::Requested, &RuntimeContext::default());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(report.skipped(), 1);
+    }
+
+    #[test]
+    fn test_standby_from_another_process_is_not_used() {
+        let r = runner(vec![Box::new(hook_from_fn("h", 0, |_| {}))], 5_000, 10_000);
+        let (tx, rx) = mpsc::channel::<Assignment>();
+        core::mem::forget(rx);
+        *lock(&r.standby) = Some((std::process::id().wrapping_add(1), tx));
+        let start = Instant::now();
+        let report = r.run_blocking(ShutdownReason::Requested, &RuntimeContext::default());
+        assert_eq!(report.completed(), 1);
+        // No hand-off grace was needed: a fresh worker started at once.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

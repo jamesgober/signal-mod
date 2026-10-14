@@ -2,8 +2,8 @@
 //!
 //! | Feature    | Back-end                                                    |
 //! | ---------- | ----------------------------------------------------------- |
-//! | `tokio`    | [`tokio_rt`]: one `tokio::signal` listener task per signal (Unix); the shared console handler (Windows). |
-//! | `agnostic` | [`agnostic`]: a signal-hook listener thread on Unix, a console control handler on Windows. |
+//! | `tokio`    | [`tokio_rt`]: one `tokio::signal` listener task per signal. |
+//! | `agnostic` | [`agnostic`]: a listener thread (signal-hook on Unix, Tokio's console-event streams on Windows when `tokio` is enabled), or signal-mod's own console control handler on Windows without `tokio`. |
 //!
 //! Selection happens at install time: with `tokio` enabled and a Tokio
 //! runtime current, the Tokio back-end is used; otherwise the agnostic
@@ -26,8 +26,11 @@ pub(crate) mod restore;
 #[cfg(all(unix, any(feature = "tokio", feature = "agnostic")))]
 pub(crate) mod disposition;
 
-#[cfg(all(windows, any(feature = "tokio", feature = "agnostic")))]
+#[cfg(all(windows, feature = "agnostic", not(feature = "tokio")))]
 pub(crate) mod console;
+
+#[cfg(all(windows, feature = "tokio"))]
+pub(crate) mod windows_events;
 
 #[cfg(feature = "tokio")]
 pub(crate) mod tokio_rt;
@@ -52,10 +55,13 @@ pub(crate) mod agnostic;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Backend {
-    /// `tokio::signal` listener tasks on the current Tokio runtime.
+    /// `tokio::signal` listener tasks on the current Tokio runtime (Unix
+    /// signal streams, or Windows console-event streams).
     Tokio,
-    /// The `agnostic` back-end: a listener thread on Unix, a console
-    /// control handler on Windows.
+    /// The `agnostic` back-end: a listener thread (signal-hook on Unix,
+    /// Tokio's console-event streams on Windows when the `tokio` feature
+    /// is enabled), or signal-mod's own console control handler on
+    /// Windows without it.
     Agnostic,
 }
 
@@ -129,7 +135,10 @@ pub(crate) fn install(dispatcher: &Arc<Dispatcher>, set: SignalSet) -> Result<Re
 }
 
 /// Map a registration failure for `sig` into the crate error.
-#[cfg(all(unix, any(feature = "tokio", feature = "agnostic")))]
+#[cfg(any(
+    all(unix, any(feature = "tokio", feature = "agnostic")),
+    all(windows, feature = "tokio")
+))]
 pub(crate) fn registration_error(
     sig: crate::signal::Signal,
     source: std::io::Error,
