@@ -192,7 +192,13 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
+      # The 1.0.0 baseline's `async-std` feature pulls rustix 0.37, which no
+      # longer builds on current stable; compare the features both
+      # versions share and that still build.
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: only-explicit-features
+          features: std,tokio,ctrlc-fallback
 
   security:
     name: Security (audit + deny)
