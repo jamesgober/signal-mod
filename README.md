@@ -92,7 +92,7 @@ signal-mod = { version = "2", features = ["tracing", "tokio-util"] }
 | ---------------- | ------- | ------------------------------------------------------------------------------------------- |
 | `std`            | yes     | Reserved for a future `no_std` core.                                                         |
 | `tokio`          | yes     | `install()` inside a Tokio runtime uses `tokio::signal` listener tasks.                      |
-| `agnostic`       | no      | `install()` anywhere: a listener thread (Unix) or console control handler (Windows).         |
+| `agnostic`       | no      | `install()` anywhere: a listener thread (Windows without `tokio`: a console control handler). |
 | `smol`           | no      | Alias of `agnostic`.                                                                        |
 | `ctrlc-fallback` | no      | 1.x name, now an alias of `agnostic` (covers every signal, not just Ctrl+C).                |
 | `async-std`      | no      | Deprecated alias of `agnostic`. async-std is discontinued; the crate is no longer pulled in. |
@@ -281,10 +281,17 @@ nanoseconds.
 | `Coordinator::statistics` (16 hooks)             | 425 ns        | n/a      |
 | subscription deliver + `try_recv`                | 86 ns         | n/a      |
 | `SignalSet::iter` (all 7, same harness)          | 3.3-3.7 ns    | 2.9-3.7 ns |
-| `Coordinator::run_hooks` (1 hook)                | 25 us         | 74 ns    |
-| `Coordinator::run_hooks` (4 hooks)               | 29 us         | 198 ns   |
-| `Coordinator::run_hooks` (64 hooks)              | 43 us         | 2.6 us   |
+| `Coordinator::run_hooks` (1 hook)                | 23 us         | 74 ns    |
+| `Coordinator::run_hooks` (4 hooks)               | 25-200 us (*) | 198 ns   |
+| `Coordinator::run_hooks` (64 hooks)              | 34 us         | 2.6 us   |
+| `Coordinator::builder().build()` (no hooks)      | 193 ns        | n/a      |
+| `Coordinator::builder().build()` (16 hooks)      | 48 us         | n/a      |
 | `wait_blocking_timeout(1 us)` (not initiated)    | 15.6 ms       | 15.2 ms  |
+
+(*) Scheduler variance on Windows under load: the median moved between
+29 us and 96 us across runs. `run_hooks` and `build()` were re-measured
+on 2026-10-14 at about 70 % background load; the other rows are from
+the back-to-back comparison run.
 
 - The observer paths got faster: the reason is published in atomics, so
   `reason()` and a redundant `trigger()` are plain loads.
@@ -294,7 +301,9 @@ nanoseconds.
   stop a hung one). A coordinator with hooks therefore parks a standby
   worker thread when it is built; a run costs one hand-off to it and one
   wake-up of the caller: tens of microseconds, once per coordinator run,
-  with large scheduler variance on Windows. Hooks that finish in time
+  with large scheduler variance on Windows. The thread spawn itself moved
+  into `build()` (the 16-hook row). The maintainer accepted this
+  regression as the justified cost of the enforced deadline. Hooks that finish in time
   add no context switch each, so 64 hooks cost about the same as one.
 - `wait_blocking_timeout` with a sub-millisecond budget measures the
   Windows timer granularity (about 15.6 ms), not the primitive.

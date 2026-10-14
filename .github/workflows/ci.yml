@@ -192,13 +192,29 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
-      # The 1.0.0 baseline's `async-std` feature pulls rustix 0.37, which no
-      # longer builds on current stable; compare the features both
-      # versions share and that still build.
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
+      # The baseline is the latest release on crates.io. Against a 1.x
+      # baseline (only while 2.0.0 is unreleased) the check is limited to
+      # the features both lines share: 1.0.0's `async-std` feature pulls
+      # rustix 0.37, which no longer builds on current stable, and a major
+      # bump skips every check anyway. From 2.0.0 on, every feature is
+      # compared.
+      - name: Choose the baseline feature set
+        id: baseline
+        run: |
+          latest=$(curl -fsSL -H "User-Agent: signal-mod-ci (github.com/jamesgober/signal-mod)"             https://crates.io/api/v1/crates/signal-mod | jq -r .crate.max_stable_version)
+          echo "latest published: $latest"
+          echo "major=${latest%%.*}" >> "$GITHUB_OUTPUT"
+      - name: cargo-semver-checks (1.x baseline, shared features)
+        if: steps.baseline.outputs.major == '1'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           feature-group: only-explicit-features
           features: std,tokio,ctrlc-fallback
+      - name: cargo-semver-checks (all features)
+        if: steps.baseline.outputs.major != '1'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: all-features
 
   security:
     name: Security (audit + deny)

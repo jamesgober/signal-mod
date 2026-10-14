@@ -29,8 +29,10 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
 - Force phase: hooks not started when `graceful_timeout` runs out start
   with `ShutdownReason::Forced` until `force_timeout` (total budget)
   runs out; the rest are `Skipped`. Both budgets are measured from the
-  moment the first hook starts, so worker start-up never eats into them
-  and the first hook always starts in the graceful phase (SM2-002).
+  moment the `run_hooks*` call starts the run, everything (including
+  the hand-off to the worker thread) counts against them, and
+  `force_timeout` is a hard upper bound on the run. A worker thread that
+  does not start within 250 ms is replaced (SM2-002, SM2-016).
   `force_timeout` was previously stored but unused (SM-002, D1, D2).
 - `HookContext::current()` inside a hook: `deadline()`, `remaining()`,
   `is_abandoned()`, so long hooks can cooperate with the deadline
@@ -67,11 +69,13 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   `active_subsystems`, `subsystems_finished` / `SubsystemsFinished`,
   `wait_subsystems_blocking`.
 - `ShutdownTrigger::token`.
-- Feature `agnostic` (alias `smol`): runtime-agnostic back-end, a
-  signal-hook listener thread on Unix and a console control handler on
-  Windows that tells all five console events apart. The Tokio back-end
-  uses the same handler on Windows, so coordinators installed through
-  either back-end all receive every event (SM2-005).
+- Feature `agnostic` (alias `smol`): runtime-agnostic back-end. Unix: a
+  signal-hook listener thread. Windows with the `tokio` feature: a
+  listener thread polling Tokio's console-event streams without a
+  runtime, so coordinators of both back-ends and the application's own
+  `tokio::signal` listeners share Tokio's handler and all receive every
+  event (SM2-005, SM2-017). Windows without `tokio`: signal-mod's own
+  console control handler, which tells all five console events apart.
 - Feature `tracing`: events for deliveries, installs, hooks and
   escalation.
 - Feature `tokio-util`: `ShutdownToken::cancellation_token` and
@@ -110,9 +114,11 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   (D15).
 - No lock is held while hooks run: `statistics()` and `Debug` work from
   inside a hook and never wait for a running hook (SM-005).
-- A coordinator with hooks parks one standby worker thread at build
-  time, so `run_hooks` hands off to it instead of spawning a thread
-  (SM2-010).
+- A coordinator with hooks parks one standby worker thread at
+  `build()`, so `run_hooks` hands off to it instead of spawning a thread
+  (SM2-010). The standby records its process id: in a process forked
+  after `build()` (which does not inherit the thread) the run starts a
+  fresh worker instead of waiting forever (SM2-016).
 - `install()` picks the back-end at call time (Tokio inside a Tokio
   runtime, otherwise the agnostic back-end) and is all-or-nothing:
   every stream is registered before any listener starts (SM-014).
@@ -142,7 +148,11 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   notes or lint configs).
 - CI runs on pull requests and on pushes to `main`, `feature/**` and
   `fix/**`, with the lint toolchain pinned (1.99.0, bumped deliberately
-  together with `rust-toolchain.toml`) (SM2-001, SM2-011).
+  together with `rust-toolchain.toml`) (SM2-001, SM2-011). The semver job
+  compares against the latest crates.io release: every feature from
+  2.0.0 on, the features shared with 1.x until then (SM2-018).
+- Benchmarks for `Coordinator::builder().build()` with and without hooks
+  (SM2-020).
 
 ### Deprecated
 

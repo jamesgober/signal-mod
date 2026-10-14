@@ -79,8 +79,8 @@ assert_eq!(coord.run_hooks(ShutdownReason::Requested), 1);
 | Feature          | Default | Effect                                                                                     |
 | ---------------- | ------- | ------------------------------------------------------------------------------------------ |
 | `std`            | yes     | Reserved for a future `no_std` core.                                                        |
-| `tokio`          | yes     | `install` inside a Tokio runtime spawns one `tokio::signal` listener task per signal.        |
-| `agnostic`       | no      | `install` anywhere: a signal-hook listener thread (Unix) or a console control handler (Windows). |
+| `tokio`          | yes     | `install` inside a Tokio runtime spawns one `tokio::signal` listener task per signal (Unix signals or Windows console events). |
+| `agnostic`       | no      | `install` anywhere: a listener thread (signal-hook on Unix; Tokio's console-event streams on Windows when `tokio` is enabled), or signal-mod's own console control handler on Windows without `tokio`. |
 | `smol`           | no      | Alias of `agnostic`.                                                                       |
 | `ctrlc-fallback` | no      | 1.x name, alias of `agnostic`.                                                             |
 | `async-std`      | no      | Deprecated alias of `agnostic`; no longer pulls in the discontinued async-std crate.       |
@@ -461,9 +461,11 @@ assert_eq!(hook.timeout(), Some(Duration::from_secs(1)));
    `Error::NoRuntime` (no back-end).
 
 Installation is all-or-nothing. Several coordinators can be installed
-at once, through either back-end, and every one receives its signals
-(on Windows both back-ends share one console control handler for that
-reason).
+at once, through either back-end, and every one receives its signals.
+On Windows with the `tokio` feature, both back-ends go through Tokio's
+console handler, which also serves the application's own
+`tokio::signal` listeners, so everybody sees every event. See
+[Platform behavior](#platform-behavior) for Windows without `tokio`.
 
 After the last coordinator covering a signal is uninstalled or dropped:
 
@@ -556,22 +558,27 @@ Hooks are sorted once at `build()` by descending priority (stable: ties
 keep registration order). A run then goes through:
 
 1. **Graceful phase.** Starts hooks with the caller's reason until
-   `graceful_timeout` has elapsed since the first hook started.
+   `graceful_timeout` has elapsed since the run started.
 2. **Force phase.** Starts the remaining hooks with
    `ShutdownReason::Forced` until `force_timeout` has elapsed since the
-   first hook started. `force_timeout <= graceful_timeout` disables it.
-
-The clock starts when the worker is about to start the first hook, so
-the first hook always starts in the graceful phase (unless that budget
-is zero), however long the worker thread took to be scheduled.
+   run started. `force_timeout <= graceful_timeout` disables it.
 3. **Skipped.** Hooks not started when the force budget is gone.
+
+Both budgets are measured from the moment the `run_hooks*` call starts
+the run, and everything counts against them, including the hand-off to
+the worker thread (microseconds with the parked standby worker).
 
 Each hook runs on a worker thread; the run waits for it until the
 earliest of its own `timeout()` and the current phase's deadline. On
 expiry the hook is `TimedOut` and abandoned (its thread keeps running
-it), and the next hook starts on a fresh worker. So a run returns within
-`force_timeout` (plus scheduling noise) whatever the hooks do.
-`Duration::MAX` budgets disable the deadlines.
+it), and the next hook starts on a fresh worker. A worker that does not
+start within 250 ms (for example the standby thread, which does not
+survive a `fork` after `build()`) is replaced. So a run returns within
+`force_timeout` (plus scheduling noise) whatever the hooks or threads
+do. `Duration::MAX` budgets disable the deadlines.
+
+`build()` starts the parked standby worker when hooks are registered; it
+uses no CPU and exits when the coordinator is dropped or after the run.
 
 **Run-once.** The first `run_hooks*` call runs the ladder. Every other
 call, concurrent or later, sync or async, waits for that run and returns
@@ -587,7 +594,7 @@ use std::time::Duration;
 use signal_mod::{Coordinator, HookPhase, HookStatus, ShutdownReason, hook_from_fn};
 
 let coord = Coordinator::builder()
-    .graceful_timeout(Duration::from_millis(200))
+    .graceful_timeout(Duration::from_secs(2))
     .force_timeout(Duration::from_secs(20))
     .hook(hook_from_fn("hangs", 10, |_| std::thread::sleep(Duration::from_secs(30))))
     .hook(hook_from_fn("flush", 0, |reason| assert_eq!(reason, ShutdownReason::Forced)))
@@ -829,10 +836,19 @@ over once the last coordinator covering the signal is gone (see
 [`install`](#install)). A second-signal escalation re-raises the signal
 with its default action, so the parent sees a death by that signal.
 
-**Windows.** Both back-ends use one shared console control handler.
+**Windows.** With the `tokio` feature, both back-ends use Tokio's
+console-event streams (the agnostic back-end polls them from its
+listener thread, without a runtime), so coordinators and the
+application's own `tokio::signal` listeners share Tokio's one console
+handler and all see every event. Without the `tokio` feature, the
+agnostic back-end registers signal-mod's own console control handler.
 Windows calls console handlers last-registered first and stops at the
-first that claims the event, so a handler registered by other code after
-signal-mod's sees events first (and can hide them from it).
+first that claims the event, so that handler hides events from console
+handlers registered earlier by other code (for example the
+application's own Tokio, if it uses one but signal-mod's `tokio` feature
+is off), and a handler registered later by other code can hide events
+from signal-mod. Enable the `tokio` feature whenever the application
+uses `tokio::signal` itself.
 `Interrupt` is Ctrl+C, `Quit` Ctrl+Break, `Terminate` the
 console window closing, `Hangup` logoff or system shutdown (delivered to
 services only). After `CTRL_CLOSE_EVENT` the OS terminates the process
@@ -851,10 +867,10 @@ of `installed_signals()`.
 [README](../README.md#performance). The observer hot paths
 (`is_initiated`, `reason`, polling a ready `wait()` future) are
 lock-free loads. A coordinator with hooks parks one standby worker
-thread when it is built, so a hook run does not pay for a thread spawn:
-it costs one hand-off to that thread and one wake-up of the caller, once
-per coordinator run. Hooks that finish in time add no context switch
-each.
+thread when it is built (the README lists what `build()` costs), so a
+hook run does not pay for a thread spawn: it costs one hand-off to that
+thread and one wake-up of the caller, once per coordinator run. Hooks
+that finish in time add no context switch each.
 
 ---
 

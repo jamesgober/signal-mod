@@ -238,8 +238,8 @@ audited crates: `tokio::signal` (Unix), and `signal-hook` for the Unix
 agnostic back-end and default restoration. Two modules opt out locally,
 each with a `// SAFETY:` justification on every block:
 
-- `install/console.rs` (Windows): one `SetConsoleCtrlHandler` call
-  (through `windows-sys`). The handler it registers never unwinds across
+- `install/console.rs` (Windows, agnostic back-end without the `tokio`
+  feature): one `SetConsoleCtrlHandler` call (through `windows-sys`). The handler it registers never unwinds across
   the FFI boundary (panics are caught).
 - `install/disposition.rs` (Unix): one read-only `sigaction` call (null
   new action) that reads a signal's disposition before signal-mod first
@@ -259,9 +259,11 @@ toolchain separately (dev-dependencies such as criterion need newer).
 - The first `trigger` takes one uncontended lock, publishes with
   `Release`, and wakes waiters after releasing it.
 - `wait()` never polls on a timer: the trigger wakes the task.
-- Hooks are sorted once at `build()`. A hook run spawns one worker
-  thread (plus a fresh one per timed-out hook) and does not context
-  switch per hook while hooks finish in time.
+- Hooks are sorted once at `build()`, which also parks one standby
+  worker thread when hooks are registered. A hook run hands off to it
+  (a fresh thread after a timed-out hook, or in a forked child) and does
+  not context switch per hook while hooks finish in time.
+  `force_timeout` is a hard upper bound on a run.
 - Every number in the README is produced by `benches/shutdown_bench.rs`.
 
 ## 8. Stability guarantees
@@ -293,7 +295,7 @@ Everything else is optional and feature-gated:
 | `libc`        | always, Unix only       | per-target signal numbers                                |
 | `tokio`       | `tokio`                 | listener tasks, runtime context for hooks (`rt`, `signal`) |
 | `signal-hook` | `tokio`, `agnostic` (Unix) | listener iterator; conditional default restoration    |
-| `windows-sys` | `tokio`, `agnostic` (Windows) | `SetConsoleCtrlHandler` (shared console handler)   |
+| `windows-sys` | `agnostic` (Windows)    | `SetConsoleCtrlHandler`, only without the `tokio` feature |
 | `tracing`     | `tracing`               | diagnostics                                              |
 | `tokio-util`  | `tokio-util`            | `CancellationToken` interop                              |
 

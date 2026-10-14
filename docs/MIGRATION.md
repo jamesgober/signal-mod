@@ -108,6 +108,15 @@ struct literal, or destructured it exhaustively, must use `..`. New
 fields: `hooks_panicked`, `hooks_timed_out`, `hooks_skipped`, `hooks`
 (per-hook status and timings), `installed`, `active_subsystems`.
 
+### `build()` starts a parked thread when hooks are registered
+
+So that running the hooks does not pay for a thread spawn, a coordinator
+with hooks parks one worker thread from `build()` until it runs its
+hooks or is dropped. A process that `fork`s after `build()` does not
+inherit it; the run in the child starts a fresh worker, so hooks still
+run within the budget. Programs that daemonize should still build the
+coordinator after forking.
+
 ### Back-end selection happens at `install()` time
 
 1.x picked one back-end at compile time and let `tokio` silently win.
@@ -228,12 +237,18 @@ eprintln!("stopping: {:?}", token.reason());
   neither set. Alternatively call
   `coord.trigger().trigger(ShutdownReason::Signal(sig))`, which needs no
   configuration.
+- **Your own `tokio::signal` listeners on Windows:** with signal-mod's
+  `tokio` feature (the default), both signal-mod back-ends use Tokio's
+  console-event streams, so your listeners and every coordinator see
+  each event, as in 1.x. With `default-features = false` and only
+  `agnostic`, signal-mod registers its own console handler; Windows
+  calls the most recently registered handler first and stops at the
+  first that claims the event, so your earlier Tokio listeners then
+  stop seeing the events signal-mod covers. Enable signal-mod's `tokio`
+  feature if your program uses `tokio::signal` itself.
 - **Other Windows console handlers (the `ctrlc` crate, another
-  library):** Windows calls the most recently registered handler first
-  and stops at the first that claims the event. Both signal-mod
-  back-ends share one handler, so signal-mod coordinators never hide
-  events from each other, but a handler registered by other code later
-  can hide them from signal-mod. Prefer one owner.
+  library):** the same last-registered-first rule applies between
+  signal-mod and them. Prefer one owner.
 
 ## Versioning policy
 
