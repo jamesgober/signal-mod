@@ -1,8 +1,7 @@
-//! Customizing the `SignalSet`.
+//! Building `SignalSet` values.
 //!
-//! Shows the three named constructors plus the builder-style
-//! `with` / `without` operators. Every `SignalSet` constructor is
-//! `const`, so default sets can be embedded in `static` items.
+//! Every constructor is `const`, so sets can live in `const` / `static`
+//! items, and sets combine with `|`, `&` and `-`.
 //!
 //! Run with:
 //!
@@ -12,32 +11,31 @@
 
 use signal_mod::{Signal, SignalSet};
 
-const GRACEFUL_PLUS_USR1: SignalSet = SignalSet::graceful().with(Signal::User1);
+const RELOAD: SignalSet = SignalSet::empty().with(Signal::Hangup).with(Signal::User1);
+const SHUTDOWN: SignalSet = SignalSet::standard().difference(RELOAD);
 
 fn main() {
-    println!("preset constructors:");
-    print_set("empty", SignalSet::empty());
-    print_set("graceful (default)", SignalSet::graceful());
-    print_set("standard", SignalSet::standard());
-    print_set("all", SignalSet::all());
+    println!("presets:");
+    println!("  empty    {:?}", SignalSet::empty());
+    println!("  graceful {:?}", SignalSet::graceful());
+    println!("  standard {:?}", SignalSet::standard());
+    println!("  all      {:?}", SignalSet::all());
 
-    println!("\nbuilder-style composition:");
-    print_set("graceful + User1", GRACEFUL_PLUS_USR1);
-    print_set(
-        "standard without Quit",
-        SignalSet::standard().without(Signal::Quit),
-    );
+    println!("\ncomposition:");
+    println!("  reload            {RELOAD:?}");
+    println!("  shutdown          {SHUTDOWN:?}");
+    println!("  shutdown | reload {:?}", SHUTDOWN | RELOAD);
+    let collected: SignalSet = [Signal::Quit, Signal::Pipe].into_iter().collect();
+    println!("  collected         {collected:?}");
 
-    println!("\nplatform availability:");
+    println!("\nthis platform ({}):", std::env::consts::OS);
     for sig in Signal::ALL {
         println!(
-            "  {sig:?}: available_on_current_platform={}",
-            sig.available_on_current_platform()
+            "  {:<9} number={:<10} exit_code={:<4} deliverable={}",
+            format!("{sig:?}"),
+            format!("{:?}", sig.unix_number()),
+            sig.exit_code(),
+            sig.available_on_current_platform(),
         );
     }
-}
-
-fn print_set(label: &str, set: SignalSet) {
-    let names: Vec<String> = set.iter().map(|s| format!("{s:?}")).collect();
-    println!("  {label}: [{}]", names.join(", "));
 }

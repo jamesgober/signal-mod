@@ -1,821 +1,884 @@
-# signal-mod - API Reference
+# signal-mod - API Guide
 
-Authoritative offline mirror of the rustdoc-generated API for
-`signal-mod`. Every public item is documented here with description,
-parameter / return semantics, and at least one runnable code example.
+Reference for every public item of `signal-mod` 2.x, with the behavior
+behind it. The rustdoc on [docs.rs](https://docs.rs/signal-mod) carries
+the same contracts item by item; this guide adds the cross-cutting
+explanations. Every Rust block below is compiled (and, unless marked
+`no_run`, executed) by `cargo test --doc`.
 
-For the design contract (mission, scope, dependency policy) see
-[`REPS.md`](../REPS.md). For migration history see
-[`MIGRATION.md`](MIGRATION.md). For the performance baseline see
-[Performance](#performance).
-
----
+For the design contract see [`REPS.md`](../REPS.md); for upgrading from
+1.x see [`MIGRATION.md`](MIGRATION.md).
 
 ## Table of contents
 
-- [Crate root](#crate-root)
+- [Concepts](#concepts)
+- [Back-ends and features](#back-ends-and-features)
 - [`Signal`](#signal)
-- [`SignalSet`](#signalset)
-- [`SignalSetIter`](#signalsetiter)
+- [`SignalSet`](#signalset) and [`SignalSetIter`](#signalsetiter)
 - [`ShutdownReason`](#shutdownreason)
-- [`ShutdownToken`](#shutdowntoken)
+- [`ShutdownToken`](#shutdowntoken), [`ShutdownFuture`](#shutdownfuture),
+  [`SubsystemGuard`](#subsystemguard), [`SubsystemsFinished`](#subsystemsfinished)
 - [`ShutdownTrigger`](#shutdowntrigger)
-- [`ShutdownHook`](#shutdownhook)
-- [`FnHook`](#fnhook)
-- [`hook_from_fn`](#hook_from_fn)
+- [`ShutdownHook`](#shutdownhook), [`HookContext`](#hookcontext), [`FnHook`](#fnhook), [`hook_from_fn`](#hook_from_fn)
 - [`Coordinator`](#coordinator)
 - [`CoordinatorBuilder`](#coordinatorbuilder)
+- [Running hooks: the deadline ladder](#running-hooks-the-deadline-ladder)
+- [`RunReport`](#runreport), [`HookOutcome`](#hookoutcome), [`HookStatus`](#hookstatus), [`HookPhase`](#hookphase), [`RunHooksFuture`](#runhooksfuture)
 - [`Statistics`](#statistics)
-- [`Error`](#error)
-- [`Result`](#result)
+- [`SignalSubscription`](#signalsubscription) and [`Recv`](#recv)
+- [`Backend`](#backend)
+- [`shutdown_signal`](#shutdown_signal) and [`ShutdownSignal`](#shutdownsignal)
+- [`Error`](#error) and [`Result`](#result)
 - [`VERSION`](#version)
-- [Cargo features](#cargo-features)
+- [Platform behavior](#platform-behavior)
 - [Performance](#performance)
 
 ---
 
-## Crate root
+## Concepts
+
+A **coordinator** owns one shutdown. It installs OS signal listeners,
+hands out two kinds of handle, and runs cleanup hooks:
+
+- [`ShutdownToken`](#shutdowntoken) observes: `is_initiated`, `reason`,
+  `wait().await`, `wait_blocking()`.
+- [`ShutdownTrigger`](#shutdowntrigger) initiates: `trigger(reason)`.
+  The first trigger wins; later ones return `false`.
+
+Splitting the two keeps "may stop the process" a capability you hand out
+on purpose. Both cost one `Arc` clone to copy.
+
+Signals come in two sets: the **shutdown set** (initiates shutdown) and
+the **notify set** (delivered to [`SignalSubscription`](#signalsubscription)s
+only: SIGHUP for reload, SIGUSR1 for log rotation).
+
+**Hooks** run once, in descending priority, under an enforced
+graceful-then-force deadline; see
+[the deadline ladder](#running-hooks-the-deadline-ladder).
 
 ```rust
-pub const VERSION: &str;
+use signal_mod::{Coordinator, ShutdownReason, Signal, SignalSet, hook_from_fn};
 
-pub use coord::{Coordinator, CoordinatorBuilder, Statistics};
-pub use error::{Error, Result};
-pub use hook::{hook_from_fn, FnHook, ShutdownHook};
-pub use reason::ShutdownReason;
-pub use signal::{Signal, SignalSet, SignalSetIter};
-pub use token::{ShutdownToken, ShutdownTrigger};
+let coord = Coordinator::builder()
+    .signals(SignalSet::graceful() - Signal::Hangup)
+    .notify_signals(SignalSet::from(Signal::Hangup))
+    .hook(hook_from_fn("flush", 0, |_| {}))
+    .build();
+
+let token = coord.token();
+let trigger = coord.trigger();
+assert!(trigger.trigger(ShutdownReason::Requested));
+assert_eq!(token.reason(), Some(ShutdownReason::Requested));
+assert_eq!(coord.run_hooks(ShutdownReason::Requested), 1);
 ```
 
-Every item above is part of the stable `1.0` surface and is covered
-by semver.
+---
+
+## Back-ends and features
+
+| Feature          | Default | Effect                                                                                     |
+| ---------------- | ------- | ------------------------------------------------------------------------------------------ |
+| `std`            | yes     | Reserved for a future `no_std` core.                                                        |
+| `tokio`          | yes     | `install` inside a Tokio runtime spawns one `tokio::signal` listener task per signal (Unix signals or Windows console events). |
+| `agnostic`       | no      | `install` anywhere: a listener thread (signal-hook on Unix; Tokio's console-event streams on Windows when `tokio` is enabled), or signal-mod's own console control handler on Windows without `tokio`. |
+| `smol`           | no      | Alias of `agnostic`.                                                                       |
+| `ctrlc-fallback` | no      | 1.x name, alias of `agnostic`.                                                             |
+| `async-std`      | no      | Deprecated alias of `agnostic`; no longer pulls in the discontinued async-std crate.       |
+| `tracing`        | no      | `tracing` events (target `signal_mod`) for deliveries, installs, hooks and escalation.     |
+| `tokio-util`     | no      | `ShutdownToken::cancellation_token` and `From<&ShutdownToken> for CancellationToken`.       |
+
+[`Coordinator::install`](#coordinator) picks the back-end when it is
+called: Tokio if the `tokio` feature is on and a Tokio runtime is
+current, otherwise the agnostic back-end if enabled, otherwise an error
+that says what is missing. Waiting, subscriptions and
+`run_hooks_async` are runtime-agnostic in every configuration.
 
 ---
 
 ## `Signal`
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Signal {
-    Terminate,
-    Interrupt,
-    Quit,
-    Hangup,
-    Pipe,
-    User1,
-    User2,
-}
+pub enum Signal { Terminate, Interrupt, Quit, Hangup, Pipe, User1, User2 }
 ```
 
-Platform-neutral signal identifier. The variants map to:
+| Variant     | Unix     | Windows                                    |
+| ----------- | -------- | ------------------------------------------ |
+| `Terminate` | SIGTERM  | `CTRL_CLOSE_EVENT`                         |
+| `Interrupt` | SIGINT   | `CTRL_C_EVENT`                             |
+| `Quit`      | SIGQUIT  | `CTRL_BREAK_EVENT`                         |
+| `Hangup`    | SIGHUP   | `CTRL_LOGOFF_EVENT`, `CTRL_SHUTDOWN_EVENT` |
+| `Pipe`      | SIGPIPE  | never delivered                            |
+| `User1`     | SIGUSR1  | never delivered                            |
+| `User2`     | SIGUSR2  | never delivered                            |
 
-| Variant     | Unix     | Windows                |
-| ----------- | -------- | ---------------------- |
-| `Terminate` | SIGTERM  | `CTRL_CLOSE_EVENT`     |
-| `Interrupt` | SIGINT   | `CTRL_C_EVENT`         |
-| `Quit`      | SIGQUIT  | `CTRL_BREAK_EVENT`     |
-| `Hangup`    | SIGHUP   | `CTRL_SHUTDOWN_EVENT`  |
-| `Pipe`      | SIGPIPE  | inert                  |
-| `User1`     | SIGUSR1  | inert                  |
-| `User2`     | SIGUSR2  | inert                  |
+| Item                                    | Meaning                                                                 |
+| --------------------------------------- | ----------------------------------------------------------------------- |
+| `ALL: [Signal; 7]`                      | Every variant, canonical order.                                          |
+| `description(self) -> &'static str`     | Label used by `Display`.                                                 |
+| `unix_number(self) -> Option<i32>`      | Number **on the compiled target** (from `libc`); POSIX numbers off Unix, `None` for USR1/USR2 there. |
+| `from_unix_number(i32) -> Option<Self>` | Inverse of `unix_number`.                                                |
+| `exit_code(self) -> i32`                | `128 + number` (130 for SIGINT, 143 for SIGTERM).                        |
+| `is_unix_only(self) -> bool`            | `Pipe`, `User1`, `User2`.                                                |
+| `available_on_current_platform(self)`   | Whether this target can deliver it.                                      |
 
-The enum is `#[non_exhaustive]`; downstream `match`es must include
-a wildcard arm.
+Signal numbers are per target: SIGUSR1 is 10 on Linux x86/ARM, 16 on
+MIPS Linux, 30 on macOS and the BSDs. (1.0.0 hard-coded the Linux
+values, so on macOS its async-std back-end registered SIGBUS for
+`User1`.)
 
-### Associated items
-
-| Item                                                    | Description                                                                |
-| ------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `const ALL: [Signal; 7]`                                | Every variant in canonical order.                                          |
-| `const fn description(self) -> &'static str`            | Human-readable label, used by `Display` and logging.                       |
-| `const fn unix_number(self) -> Option<i32>`             | Canonical Unix signal number.                                              |
-| `const fn is_unix_only(self) -> bool`                   | `true` for variants with no Windows analog.                                |
-| `const fn available_on_current_platform(self) -> bool`  | `true` if the platform supports this signal's handler installation.        |
-
-### Examples
-
-Iterate the canonical list and inspect each variant:
+`Pipe`: Rust programs ignore SIGPIPE by default so writes to a closed
+pipe return `EPIPE`. Putting `Pipe` in the shutdown set turns every such
+write into a graceful shutdown. Only do that on purpose.
 
 ```rust
 use signal_mod::Signal;
 
+assert_eq!(Signal::Interrupt.exit_code(), 130);
 for sig in Signal::ALL {
-    println!(
-        "{sig:?}: unix_number={:?}, unix_only={}, available={}",
-        sig.unix_number(),
-        sig.is_unix_only(),
-        sig.available_on_current_platform(),
-    );
-}
-```
-
-Pattern-match a delivered signal back from a `ShutdownReason`:
-
-```rust
-use signal_mod::{ShutdownReason, Signal};
-
-fn classify(reason: ShutdownReason) -> &'static str {
-    match reason {
-        ShutdownReason::Signal(Signal::Terminate) => "operator terminate",
-        ShutdownReason::Signal(Signal::Interrupt) => "user ctrl+c",
-        ShutdownReason::Signal(Signal::Hangup)    => "session hangup",
-        _ => "non-signal",
+    if let Some(n) = sig.unix_number() {
+        assert_eq!(Signal::from_unix_number(n), Some(sig));
     }
 }
+assert_eq!(Signal::User1.available_on_current_platform(), cfg!(unix));
 ```
 
 ---
 
 ## `SignalSet`
 
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignalSet { /* private bits */ }
-```
+A `Copy`, const-constructible bit set of signals with `|`, `&`, `-`
+(with a set or a single signal on the right), `FromIterator`, `Extend`,
+`IntoIterator` (by value and by reference) and `Hash`. `Default` is
+`graceful()`.
 
-Bit-packed, `Copy`, const-constructible set of `Signal` values.
-`SignalSet` is the input to `CoordinatorBuilder::signals` and
-determines which OS signals `Coordinator::install` will register.
-
-### Associated items
-
-| Item                                              | Description                                               |
-| ------------------------------------------------- | --------------------------------------------------------- |
-| `const fn empty() -> Self`                        | Empty set.                                                |
-| `const fn all() -> Self`                          | Every variant.                                            |
-| `const fn graceful() -> Self`                     | `Terminate \| Interrupt \| Hangup` (the default).         |
-| `const fn standard() -> Self`                     | `graceful()` plus `Quit`.                                 |
-| `const fn with(self, sig: Signal) -> Self`        | Returns a copy with `sig` enabled.                        |
-| `const fn without(self, sig: Signal) -> Self`     | Returns a copy with `sig` disabled.                       |
-| `const fn contains(self, sig: Signal) -> bool`    | Membership test.                                          |
-| `const fn is_empty(self) -> bool`                 | `true` if no signals are enabled.                         |
-| `const fn len(self) -> usize`                     | Number of signals enabled.                                |
-| `const fn iter(&self) -> SignalSetIter`           | Iterator in canonical [`Signal::ALL`] order.              |
-
-`impl Default for SignalSet` returns `SignalSet::graceful()`.
-`impl IntoIterator for SignalSet` (and `&SignalSet`) yields
-`SignalSetIter`.
-
-### Examples
-
-Build a set inline at compile time:
+| Constructor / method                    | Result                                  |
+| --------------------------------------- | --------------------------------------- |
+| `empty()`                               | no signals                              |
+| `graceful()`                            | `Terminate`, `Interrupt`, `Hangup`      |
+| `standard()`                            | `graceful()` plus `Quit`                |
+| `all()`                                 | every variant (including `Pipe`)        |
+| `with(sig)` / `without(sig)`            | add / remove one signal                 |
+| `union` / `intersection` / `difference` | const set algebra                       |
+| `contains`, `is_empty`, `len`, `iter`   | queries                                 |
+| `available_on_current_platform()`       | subset this target can deliver          |
 
 ```rust
 use signal_mod::{Signal, SignalSet};
 
-const SET: SignalSet = SignalSet::graceful()
-    .with(Signal::Quit)
-    .with(Signal::User1);
+const RELOAD: SignalSet = SignalSet::empty().with(Signal::Hangup).with(Signal::User1);
+const SHUTDOWN: SignalSet = SignalSet::standard().difference(RELOAD);
 
-assert!(SET.contains(Signal::Quit));
-assert_eq!(SET.len(), 5);
-```
+assert!(SHUTDOWN.contains(Signal::Quit));
+assert!(!SHUTDOWN.contains(Signal::Hangup));
+assert_eq!((SHUTDOWN | RELOAD).len(), 5);
+assert_eq!(SignalSet::default(), SignalSet::graceful());
 
-Iterate the enabled signals:
-
-```rust
-use signal_mod::SignalSet;
-
-for sig in SignalSet::standard() {
-    println!("standard set contains {sig:?}");
+let collected: SignalSet = [Signal::Quit, Signal::Quit].into_iter().collect();
+assert_eq!(collected.len(), 1);
+for sig in &collected {
+    assert_eq!(sig, Signal::Quit);
 }
 ```
-
-Compose at runtime:
-
-```rust
-use signal_mod::{Signal, SignalSet};
-
-fn for_workload(allow_quit: bool) -> SignalSet {
-    let mut s = SignalSet::graceful();
-    if allow_quit {
-        s = s.with(Signal::Quit);
-    }
-    s
-}
-```
-
----
 
 ## `SignalSetIter`
 
-```rust
-#[derive(Debug, Clone)]
-pub struct SignalSetIter { /* ... */ }
-
-impl Iterator for SignalSetIter {
-    type Item = Signal;
-}
-```
-
-Iterator returned by `SignalSet::iter`. Yields enabled variants in
-the canonical [`Signal::ALL`] order. The iterator is `Clone` so the
-same set can be walked multiple times by cloning the iterator
-itself.
-
-### Examples
+Iterator over a set in canonical `Signal::ALL` order; implements
+`ExactSizeIterator` and `FusedIterator`.
 
 ```rust
-use signal_mod::SignalSet;
+use signal_mod::{Signal, SignalSet};
 
-let mut iter = SignalSet::graceful().iter();
-let first = iter.clone().next();
-let second = iter.nth(1);
-assert_eq!(first, second.map(|_| first.unwrap()).or(first));
+let mut it = SignalSet::graceful().iter();
+assert_eq!(it.len(), 3);
+assert_eq!(it.next(), Some(Signal::Terminate));
+assert_eq!(it.next(), Some(Signal::Interrupt));
+assert_eq!(it.next(), Some(Signal::Hangup));
+assert_eq!(it.next(), None);
+assert_eq!(it.next(), None);
 ```
 
 ---
 
 ## `ShutdownReason`
 
-```rust
+```rust,ignore
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShutdownReason {
-    Signal(Signal),
-    Requested,
-    Forced,
-    Timeout,
-    Error,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShutdownReason { Signal(Signal), Requested, Forced, Timeout, Error }
 ```
 
-Why a shutdown was initiated. Carried with every `trigger` call and
-surfaced via `ShutdownToken::reason`.
+The crate produces `Signal(_)` (from a back-end) and `Forced` (hooks
+started in the force phase). `Requested`, `Timeout` and `Error` are
+labels for callers.
 
-### Associated items
-
-| Item                                          | Description                                  |
-| --------------------------------------------- | -------------------------------------------- |
-| `const fn description(self) -> &'static str`  | Short label: `"signal"` / `"requested"` / etc. |
-| `const fn is_signal(self) -> bool`            | `true` only for `Signal(_)`.                 |
-
-`impl Display for ShutdownReason` renders human-friendly text.
-
-### Examples
-
-Discriminate signal-driven shutdown from programmatic:
+| Method          | Result                                                        |
+| --------------- | ------------------------------------------------------------- |
+| `description()` | `"signal"`, `"requested"`, `"forced"`, `"timeout"`, `"error"` |
+| `is_signal()`   | `true` for `Signal(_)`                                        |
+| `signal()`      | the signal, if any                                            |
+| `exit_code()`   | `Signal(s)` gives `s.exit_code()`; `Requested` 0; others 1    |
 
 ```rust
 use signal_mod::{ShutdownReason, Signal};
 
-fn was_operator(reason: ShutdownReason) -> bool {
-    matches!(
-        reason,
-        ShutdownReason::Signal(Signal::Terminate)
-            | ShutdownReason::Signal(Signal::Interrupt)
-    )
-}
-```
-
-Trigger with a custom reason:
-
-```rust
-use signal_mod::{Coordinator, ShutdownReason};
-
-let coord = Coordinator::builder().build();
-coord.trigger().trigger(ShutdownReason::Error);
+let reason = ShutdownReason::Signal(Signal::Terminate);
+assert_eq!(reason.exit_code(), 143);
+assert_eq!(reason.signal(), Some(Signal::Terminate));
+assert_eq!(ShutdownReason::Requested.exit_code(), 0);
+assert_eq!(reason.to_string(), "Signal(Terminate (SIGTERM / CTRL_CLOSE_EVENT))");
 ```
 
 ---
 
 ## `ShutdownToken`
 
-```rust
-#[derive(Debug, Clone)]
-pub struct ShutdownToken { /* Arc<Inner> */ }
-```
+Cloneable observer.
 
-Cloneable observer handle. Hand one to every subsystem that needs to
-react to shutdown.
+| Method                                         | Behavior                                                       |
+| ---------------------------------------------- | -------------------------------------------------------------- |
+| `is_initiated()`                               | `Acquire` load; `true` implies `reason().is_some()`            |
+| `reason()` / `elapsed()`                       | lock-free; `Some` exactly when initiated                       |
+| `wait()` / `cancelled()` / `.await`            | [`ShutdownFuture`](#shutdownfuture); any executor, no polling  |
+| `wait_blocking()` / `wait_blocking_timeout(d)` | park the thread (condition variable)                           |
+| `child()`                                      | `(ShutdownTrigger, ShutdownToken)` of a child scope            |
+| `subsystem_guard()`                            | [`SubsystemGuard`](#subsystemguard) keeping the scope busy     |
+| `active_subsystems()`                          | live guards in this scope and its children                     |
+| `subsystems_finished()`                        | [`SubsystemsFinished`](#subsystemsfinished) future             |
+| `wait_subsystems_blocking(d)`                  | block until no guard is alive, at most `d`                     |
+| `cancellation_token()` (`tokio-util`)          | a `CancellationToken` cancelled on initiation                  |
 
-### Methods
-
-| Method                                                          | Description                                                                                              |
-| --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `fn is_initiated(&self) -> bool`                                | Relaxed atomic load of the initiated flag.                                                               |
-| `fn reason(&self) -> Option<ShutdownReason>`                    | The reason carried with the trigger, or `None` if not yet initiated.                                     |
-| `fn elapsed(&self) -> Option<Duration>`                         | Wall-clock time since shutdown was initiated.                                                            |
-| `fn wait_blocking(&self)`                                       | Park the current thread until shutdown is initiated. Returns immediately if already initiated.           |
-| `fn wait_blocking_timeout(&self, timeout: Duration) -> bool`    | Park for at most `timeout`. Returns `true` if shutdown was observed within the budget.                   |
-| `async fn wait(&self)` (with `tokio` or `async-std`)            | Async wait. Returns when shutdown is initiated. Fast-path returns immediately if already initiated.      |
-
-### Examples
-
-Observe in a Tokio task:
-
-```rust,no_run
-use signal_mod::{Coordinator, ShutdownReason};
-
-# #[cfg(feature = "tokio")]
-# async fn run(coord: Coordinator) -> signal_mod::Result<()> {
-let token = coord.token();
-token.wait().await;
-println!("shutting down: {}", token.reason().unwrap_or(ShutdownReason::Requested));
-# Ok(())
-# }
-```
-
-Observe with a budget from a sync thread:
+A **child scope** is initiated when its parent is (same reason) or by its
+own trigger, without affecting the parent: one connection, one job, one
+tenant. Guards taken in a child scope also count in every ancestor, so
+the root's `subsystems_finished()` waits for the whole tree.
 
 ```rust
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
 use std::time::Duration;
-use signal_mod::Coordinator;
+use signal_mod::{Coordinator, ShutdownReason};
 
 let coord = Coordinator::builder().build();
 let token = coord.token();
-if token.wait_blocking_timeout(Duration::from_millis(100)) {
-    println!("shutdown observed");
-} else {
-    println!("timeout elapsed; continue working");
-}
+
+// A worker that registers itself and stops on shutdown.
+let worker = tokio::spawn({
+    let token = token.clone();
+    let guard = token.subsystem_guard();
+    async move {
+        token.wait().await;
+        drop(guard); // finished draining
+    }
+});
+
+let (job_trigger, job) = token.child();
+job_trigger.trigger(ShutdownReason::Requested); // stops the job only
+assert!(job.is_initiated() && !token.is_initiated());
+
+coord.trigger().trigger(ShutdownReason::Requested);
+tokio::time::timeout(Duration::from_secs(5), token.subsystems_finished())
+    .await
+    .expect("worker drained");
+worker.await.unwrap();
+# }
 ```
+
+### `ShutdownFuture`
+
+Returned by `wait`, `cancelled` and `IntoFuture` for `ShutdownToken` and
+`&ShutdownToken`. It owns a clone of the token, so it is `'static` and
+`Send`: hand it to `tokio::spawn`, `select!`, or
+`axum::serve(..).with_graceful_shutdown(..)`. The trigger wakes it
+directly; dropping it unregisters its waker.
+
+```rust
+# #[tokio::main(flavor = "current_thread")]
+# async fn main() {
+use signal_mod::{Coordinator, ShutdownReason};
+
+let coord = Coordinator::builder().build();
+let token = coord.token();
+let by_value = tokio::spawn(token.clone().into_future());
+coord.trigger().trigger(ShutdownReason::Requested);
+by_value.await.unwrap();
+(&token).await; // already initiated: ready immediately
+# }
+```
+
+### `SubsystemGuard`
+
+Counts as one running subsystem in its scope (and its ancestors) until
+dropped.
+
+### `SubsystemsFinished`
+
+Future resolving once no guard of the scope is alive. Runtime-agnostic.
 
 ---
 
 ## `ShutdownTrigger`
 
-```rust
-#[derive(Debug, Clone)]
-pub struct ShutdownTrigger { /* Arc<Inner> */ }
-```
-
-Cloneable initiator handle. Hand one to any code path that may need
-to ask for shutdown (HTTP admin endpoint, fatal-error site,
-supervisory parent).
-
-### Methods
-
-| Method                                                | Description                                                                                                                                    |
-| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fn trigger(&self, reason: ShutdownReason) -> bool`   | Initiate shutdown. Returns `true` if this call performed the state transition; `false` if another caller (or the signal back-end) beat it.     |
-| `fn is_initiated(&self) -> bool`                      | Shared read of the atomic flag.                                                                                                                |
-
-### Examples
-
-A fatal-error branch promotes a local error into program shutdown:
+| Method                    | Behavior                                                                  |
+| ------------------------- | ------------------------------------------------------------------------- |
+| `trigger(reason) -> bool` | First call initiates (returns `true`), wakes every waiter, initiates every child scope. Later calls return `false`. |
+| `is_initiated()`          | as on the token                                                           |
+| `token()`                 | observer for the same scope                                               |
 
 ```rust
 use signal_mod::{Coordinator, ShutdownReason, ShutdownTrigger};
 
-fn handle_fatal(trigger: &ShutdownTrigger, err: &dyn std::error::Error) {
+fn on_fatal_error(trigger: &ShutdownTrigger, err: &dyn std::error::Error) {
     eprintln!("fatal: {err}");
     trigger.trigger(ShutdownReason::Error);
 }
-# let coord = Coordinator::builder().build();
-# let trigger = coord.trigger();
-# handle_fatal(&trigger, &std::io::Error::other("example"));
-```
 
-A supervisor signals shutdown from a different task:
-
-```rust,no_run
-use std::time::Duration;
-use signal_mod::{Coordinator, ShutdownReason};
-
-# #[cfg(feature = "tokio")]
-# async fn run() -> signal_mod::Result<()> {
 let coord = Coordinator::builder().build();
-let trigger = coord.trigger();
-
-tokio::spawn(async move {
-    tokio::time::sleep(Duration::from_secs(60)).await;
-    trigger.trigger(ShutdownReason::Requested);
-});
-
-coord.token().wait().await;
-# Ok(())
-# }
+on_fatal_error(&coord.trigger(), &std::io::Error::other("disk gone"));
+assert_eq!(coord.token().reason(), Some(ShutdownReason::Error));
 ```
 
 ---
 
 ## `ShutdownHook`
 
-```rust
+```rust,ignore
 pub trait ShutdownHook: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn priority(&self) -> i32 { 0 }
+    fn timeout(&self) -> Option<Duration> { None }
     fn run(&self, reason: ShutdownReason);
 }
 ```
 
-A unit of cleanup work to run during shutdown.
+Contract:
 
-- `name` is used for diagnostics and ordering tie-break visibility.
-- `priority` controls execution order. Higher values run first.
-  Defaults to `0`.
-- `run` is invoked once per `Coordinator::run_hooks` call. Panics
-  inside `run` are caught by the coordinator and do not abort the
-  remaining hooks.
-
-The trait is open. See `FnHook` for the most common closure-backed
-implementation, and `examples/custom_hook_type.rs` for a worked
-example of a stateful hook.
-
-### Examples
-
-Closure-backed (most common):
-
-```rust
-use signal_mod::{hook_from_fn, ShutdownHook, ShutdownReason};
-
-let hook = hook_from_fn("flush", 100, |reason: ShutdownReason| {
-    eprintln!("flushing: {reason}");
-});
-assert_eq!(hook.name(), "flush");
-assert_eq!(hook.priority(), 100);
-```
-
-Stateful trait impl:
+- `run` is called **at most once** per coordinator.
+- It runs on a worker thread named `signal-mod-hook`, not the caller's
+  thread. With the `tokio` feature, a Tokio runtime current on the
+  calling thread is entered there, so async cleanup can use
+  `tokio::runtime::Handle::current().block_on(..)`; call
+  `run_hooks_async` from async code so the runtime stays free to drive
+  it.
+- `timeout()` bounds this hook; past it (or past the phase deadline) the
+  hook is reported `TimedOut` and abandoned while the run continues. An
+  abandoned hook keeps running on its thread until it returns, holding
+  whatever locks it took: keep critical sections in hooks short, or
+  check [`HookContext`](#hookcontext) between steps.
+- A panic is caught and reported with its message.
 
 ```rust
-use std::sync::Arc;
-use parking_lot::Mutex;
-use signal_mod::{ShutdownHook, ShutdownReason};
+use std::time::Duration;
+use signal_mod::{Coordinator, ShutdownHook, ShutdownReason};
 
-struct BufferFlush {
-    buf: Arc<Mutex<Vec<u8>>>,
-}
+struct FlushCache;
 
-impl ShutdownHook for BufferFlush {
-    fn name(&self) -> &str { "buffer-flush" }
+impl ShutdownHook for FlushCache {
+    fn name(&self) -> &str { "flush-cache" }
     fn priority(&self) -> i32 { 50 }
-    fn run(&self, _: ShutdownReason) {
-        let mut guard = self.buf.lock();
-        // ... flush guard to disk ...
-        guard.clear();
+    fn timeout(&self) -> Option<Duration> { Some(Duration::from_secs(2)) }
+    fn run(&self, reason: ShutdownReason) {
+        println!("flushing ({reason})");
     }
 }
+
+let coord = Coordinator::builder().hook(FlushCache).build();
+assert_eq!(coord.run_hooks(ShutdownReason::Requested), 1);
 ```
 
----
+## `HookContext`
+
+`HookContext::current()` returns the context of the hook running on the
+calling thread (`None` outside a hook): `deadline()`, `remaining()` and
+`is_abandoned()`. Hooks cannot be stopped from outside; this is how a
+long hook cooperates with the deadline.
+
+```rust
+use std::time::Duration;
+use signal_mod::{Coordinator, HookContext, ShutdownReason, hook_from_fn};
+
+let coord = Coordinator::builder()
+    .hook(
+        hook_from_fn("flush-batches", 0, |_| {
+            let ctx = HookContext::current().expect("inside a hook");
+            for _batch in 0..3 {
+                if ctx.is_abandoned() {
+                    return;
+                }
+                // flush one batch ...
+            }
+        })
+        .with_timeout(Duration::from_secs(5)),
+    )
+    .build();
+assert_eq!(coord.run_hooks(ShutdownReason::Requested), 1);
+```
 
 ## `FnHook`
 
-```rust
-pub struct FnHook<F>
-where F: Fn(ShutdownReason) + Send + Sync + 'static;
-
-impl<F> FnHook<F> { pub fn new(name: impl Into<String>, priority: i32, f: F) -> Self; }
-impl<F> ShutdownHook for FnHook<F> { /* ... */ }
-```
-
-Closure-backed `ShutdownHook` returned by `hook_from_fn`. You will
-rarely need to name this type explicitly; the
-`Coordinator::builder().hook(hook_from_fn(...))` chain hides it.
-
----
+Closure-backed hook: `FnHook::new(name, priority, f)`, plus
+`.with_timeout(d)`.
 
 ## `hook_from_fn`
 
-```rust
-pub fn hook_from_fn<F>(name: impl Into<String>, priority: i32, f: F) -> FnHook<F>
-where
-    F: Fn(ShutdownReason) + Send + Sync + 'static;
-```
-
-Wrap a closure as a `ShutdownHook`.
-
-### Parameters
-
-- `name`: human-readable label for diagnostics.
-- `priority`: higher runs first.
-- `f`: closure body invoked exactly once per `run_hooks` call.
-
-### Examples
+`hook_from_fn(name, priority, f) -> FnHook<F>`.
 
 ```rust
-use signal_mod::hook_from_fn;
-use signal_mod::ShutdownHook;
+use std::time::Duration;
+use signal_mod::{ShutdownHook, hook_from_fn};
 
-let hook = hook_from_fn("close-db", 200, |reason| {
-    eprintln!("closing db: {reason}");
-});
+let hook = hook_from_fn("close-db", 200, |_| {}).with_timeout(Duration::from_secs(1));
 assert_eq!(hook.name(), "close-db");
 assert_eq!(hook.priority(), 200);
+assert_eq!(hook.timeout(), Some(Duration::from_secs(1)));
 ```
 
 ---
 
 ## `Coordinator`
 
-```rust
-pub struct Coordinator { /* ... */ }
-```
+| Method                                   | Behavior                                                             |
+| ---------------------------------------- | -------------------------------------------------------------------- |
+| `builder()`                              | [`CoordinatorBuilder`](#coordinatorbuilder)                           |
+| `token()` / `trigger()`                  | handles for the root scope                                            |
+| `install() -> Result<()>`                | install listeners for the shutdown and notify sets (see below)        |
+| `uninstall() -> bool`                    | remove them; default actions return. Also done on drop.               |
+| `is_installed()`, `backend()`, `installed_signals()` | installation state                                       |
+| `subscribe()`                            | [`SignalSubscription`](#signalsubscription)                           |
+| `simulate_signal(sig) -> bool`           | deliver as a back-end would (tests, forwarding)                       |
+| `run_hooks(reason) -> usize`             | blocking run; number of hooks completed                               |
+| `run_hooks_with_report(reason)`          | blocking run; [`RunReport`](#runreport)                               |
+| `run_hooks_async(reason)`                | [`RunHooksFuture`](#runhooksfuture); never blocks the executor        |
+| `statistics()`                           | [`Statistics`](#statistics); never blocks on a running hook           |
+| `signals()`, `notify_signals()`, `graceful_timeout()`, `force_timeout()`, `force_exit_on_second_signal()` | configuration |
 
-Owns the shutdown state machine, the hook list, and (optionally) the
-installed signal handlers. Construct via `Coordinator::builder`.
+### `install`
 
-### Methods
+1. `tokio` enabled and a Tokio runtime current: Tokio listener tasks.
+2. Otherwise, `agnostic` enabled: listener thread or console handler.
+3. Otherwise `Error::OutsideTokioRuntime` (only `tokio` enabled) or
+   `Error::NoRuntime` (no back-end).
 
-| Method                                                    | Description                                                                                                         |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `fn builder() -> CoordinatorBuilder`                      | Start a builder with default configuration.                                                                         |
-| `fn token(&self) -> ShutdownToken`                        | Create a cloneable observer handle.                                                                                 |
-| `fn trigger(&self) -> ShutdownTrigger`                    | Create a cloneable initiator handle.                                                                                |
-| `fn signals(&self) -> SignalSet`                          | Configured signal set.                                                                                              |
-| `fn graceful_timeout(&self) -> Duration`                  | Configured graceful budget (default 5s).                                                                            |
-| `fn force_timeout(&self) -> Duration`                     | Configured force budget (default 10s).                                                                              |
-| `fn is_installed(&self) -> bool`                          | `true` once `install` has succeeded.                                                                                |
-| `fn statistics(&self) -> Statistics`                      | Atomic-consistent snapshot of state.                                                                                |
-| `fn run_hooks(&self, reason: ShutdownReason) -> usize`    | Execute hooks in descending-priority order under the graceful budget. Returns count completed. Panic-safe per hook. |
-| `fn install(&self) -> Result<()>`                         | Register OS-level signal handlers per the active back-end feature.                                                  |
+Installation is all-or-nothing. Several coordinators can be installed
+at once, through either back-end, and every one receives its signals.
+On Windows with the `tokio` feature, both back-ends go through Tokio's
+console handler, which also serves the application's own
+`tokio::signal` listeners, so everybody sees every event. See
+[Platform behavior](#platform-behavior) for Windows without `tokio`.
 
-### `install` behavior
+After the last coordinator covering a signal is uninstalled or dropped:
 
-| Active features                            | Back-end                                              |
-| ------------------------------------------ | ----------------------------------------------------- |
-| `tokio` (default)                          | `tokio::signal::{unix,windows}` plus `tokio::spawn`.  |
-| `async-std` (and `tokio` not enabled)      | `signal-hook-async-std` (Unix); `ctrlc` (Windows).    |
-| `ctrlc-fallback` (no async runtime)        | `ctrlc::try_set_handler` for `Signal::Interrupt`.     |
-| none of the above                          | Returns `Error::NoRuntime`.                           |
+| Situation (Unix) | What happens the next time the signal arrives |
+| ---------------- | --------------------------------------------- |
+| shutdown signal that was at its default action when signal-mod first installed it | the default action: the process terminates (SIGQUIT dumps core). This also applies if other code registered its own handler for that signal after signal-mod did. |
+| signal that was ignored or already handled before signal-mod (SIGHUP under `nohup`, another library's handler) | left to that earlier owner |
+| notify-only signal, or SIGPIPE | absorbed (ignored), as with `tokio::signal` |
 
-`install` is idempotent on the coordinator: a second call returns
-`Error::AlreadyInstalled`. The OS-level signal slot is owned by the
-first back-end that grabs it; do not install handlers from two
-different coordinators in the same process.
+On Windows the console handler declines events nobody covers, and the
+next handler (ultimately the OS default, terminate) runs.
 
-### Errors
+`install` never panics with unwinding panics. One caveat: with the Tokio
+back-end on Unix and a runtime built without its I/O driver, Tokio panics
+inside `install`; signal-mod catches the unwind and returns
+`Error::SignalRegistration`, but the panic hook still runs, and a
+`panic = "abort"` binary aborts. `#[tokio::main]` and `Runtime::new`
+enable the driver.
 
-- `Error::AlreadyInstalled` - second `install` on this coordinator.
-- `Error::SignalRegistration { signal, source }` - platform rejected
-  a specific signal. The internal install flag is reverted on error
-  so the call can be retried after the cause is fixed.
-- `Error::NoRuntime` - no back-end feature enabled.
-
-### Examples
-
-Full happy path:
+The coordinator is the installation guard: keep it alive (normally for
+all of `main`).
 
 ```rust,no_run
-use std::time::Duration;
-use signal_mod::{hook_from_fn, Coordinator, ShutdownReason, SignalSet};
-
-# #[cfg(feature = "tokio")]
-# #[tokio::main]
-# async fn main() -> signal_mod::Result<()> {
-let coord = Coordinator::builder()
-    .signals(SignalSet::graceful())
-    .graceful_timeout(Duration::from_secs(5))
-    .hook(hook_from_fn("flush", 100, |r| eprintln!("flush: {r}")))
-    .build();
-
-coord.install()?;
-
-let token = coord.token();
-token.wait().await;
-
-let reason = token.reason().unwrap_or(ShutdownReason::Requested);
-coord.run_hooks(reason);
-# Ok(())
-# }
-```
-
-Programmatic shutdown without OS signals:
-
-```rust
 use signal_mod::{Coordinator, ShutdownReason};
 
-let coord = Coordinator::builder().build();
-let initiated = coord.trigger().trigger(ShutdownReason::Requested);
-assert!(initiated);
-assert!(coord.token().is_initiated());
+#[tokio::main]
+async fn main() -> signal_mod::Result<()> {
+    let coord = Coordinator::builder().force_exit_on_second_signal(true).build();
+    coord.install()?;
+
+    let token = coord.token();
+    token.wait().await;
+
+    let reason = token.reason().unwrap_or(ShutdownReason::Requested);
+    let report = coord.run_hooks_async(reason).await;
+    eprintln!("{report}");
+    std::process::exit(reason.exit_code());
+}
 ```
 
-Inspect statistics after a run:
+Without a runtime (feature `agnostic`):
 
-```rust
-use signal_mod::{hook_from_fn, Coordinator, ShutdownReason};
+```rust,no_run
+use signal_mod::{Coordinator, ShutdownReason};
 
-let coord = Coordinator::builder()
-    .hook(hook_from_fn("a", 0, |_| {}))
-    .hook(hook_from_fn("b", 0, |_| {}))
-    .build();
-coord.run_hooks(ShutdownReason::Requested);
-let stats = coord.statistics();
-assert_eq!(stats.hooks_registered, 2);
-assert_eq!(stats.hooks_completed, 2);
+fn main() -> signal_mod::Result<()> {
+    let coord = Coordinator::builder().build();
+    coord.install()?;
+    coord.token().wait_blocking();
+    let reason = coord.token().reason().unwrap_or(ShutdownReason::Requested);
+    coord.run_hooks(reason);
+    Ok(())
+}
 ```
 
 ---
 
 ## `CoordinatorBuilder`
 
-```rust
-pub struct CoordinatorBuilder { /* ... */ }
-
-impl CoordinatorBuilder {
-    pub fn new() -> Self;
-    pub fn signals(self, set: SignalSet) -> Self;
-    pub fn graceful_timeout(self, d: Duration) -> Self;
-    pub fn force_timeout(self, d: Duration) -> Self;
-    pub fn hook<H: ShutdownHook>(self, h: H) -> Self;
-    pub fn build(self) -> Coordinator;
-}
-```
-
-Builder for `Coordinator`. Methods consume `self` and return `self`
-so they may be chained. `impl Default for CoordinatorBuilder` is
-equivalent to `CoordinatorBuilder::new()`.
-
-Defaults:
-
-- signals: `SignalSet::graceful()`
-- graceful timeout: 5 s
-- force timeout: 10 s
-- no hooks
-
-### Examples
+| Method                              | Default                 | Meaning                                               |
+| ----------------------------------- | ----------------------- | ----------------------------------------------------- |
+| `signals(set)`                      | `SignalSet::graceful()` | signals that initiate shutdown                        |
+| `notify_signals(set)`               | empty                   | signals delivered to subscribers only                 |
+| `graceful_timeout(d)`               | 5 s                     | graceful phase budget, from the start of the hook run |
+| `force_timeout(d)`                  | 10 s                    | total budget for the run, including the force phase   |
+| `force_exit_on_second_signal(bool)` | `false`                 | a second shutdown signal ends the process (re-raised on Unix, `exit_code()` on Windows) |
+| `hook(h)`                           | none                    | register a hook                                       |
+| `build()`                           |                         | sort hooks once, create the coordinator               |
 
 ```rust
 use std::time::Duration;
-use signal_mod::{hook_from_fn, Coordinator, SignalSet};
+use signal_mod::{Coordinator, Signal, SignalSet, hook_from_fn};
 
 let coord = Coordinator::builder()
-    .signals(SignalSet::standard())
-    .graceful_timeout(Duration::from_secs(10))
-    .force_timeout(Duration::from_secs(20))
+    .signals(SignalSet::standard() - Signal::Hangup)
+    .notify_signals(SignalSet::from(Signal::Hangup))
+    .graceful_timeout(Duration::from_secs(3))
+    .force_timeout(Duration::from_secs(4))
+    .force_exit_on_second_signal(true)
     .hook(hook_from_fn("close-db", 200, |_| {}))
-    .hook(hook_from_fn("flush-logs", 100, |_| {}))
+    .build();
+assert_eq!(coord.graceful_timeout(), Duration::from_secs(3));
+```
+
+---
+
+## Running hooks: the deadline ladder
+
+Hooks are sorted once at `build()` by descending priority (stable: ties
+keep registration order). A run then goes through:
+
+1. **Graceful phase.** Starts hooks with the caller's reason until
+   `graceful_timeout` has elapsed since the run started.
+2. **Force phase.** Starts the remaining hooks with
+   `ShutdownReason::Forced` until `force_timeout` has elapsed since the
+   run started. `force_timeout <= graceful_timeout` disables it.
+3. **Skipped.** Hooks not started when the force budget is gone.
+
+Both budgets are measured from the moment the `run_hooks*` call starts
+the run, and everything counts against them, including the hand-off to
+the worker thread (microseconds with the parked standby worker).
+
+Each hook runs on a worker thread; the run waits for it until the
+earliest of its own `timeout()` and the current phase's deadline. On
+expiry the hook is `TimedOut` and abandoned (its thread keeps running
+it), and the next hook starts on a fresh worker. A worker that does not
+start within 250 ms (for example the standby thread, which does not
+survive a `fork` after `build()`) is replaced. So a run returns within
+`force_timeout` (plus scheduling noise) whatever the hooks or threads
+do. The one exception: if the OS refuses to create a thread (resource
+exhaustion), the remaining hooks run inline on the calling thread; they
+still start only within the budgets, but a hook that never returns can
+then not be abandoned. `Duration::MAX` budgets disable the deadlines.
+
+`build()` starts the parked standby worker when hooks are registered; it
+uses no CPU and exits when the coordinator is dropped or after the run.
+A child forked after `build()` runs its hooks on a fresh worker. Fork safety covers only a coordinator that was
+built: do not install it, wait on its token, or run its hooks before
+forking.
+
+**Run-once.** The first `run_hooks*` call runs the ladder. Every other
+call, concurrent or later, sync or async, waits for that run and returns
+its report. No hook body ever runs twice.
+
+**Re-entrancy.** Nothing is locked while a hook runs: a hook may call
+`statistics()`, format the coordinator, or trigger shutdown. A hook
+should not call `run_hooks` (it would wait for the run that is waiting
+for it, until the hook's deadline).
+
+```rust
+use std::time::Duration;
+use signal_mod::{Coordinator, HookPhase, HookStatus, ShutdownReason, hook_from_fn};
+
+let coord = Coordinator::builder()
+    .graceful_timeout(Duration::from_secs(2))
+    .force_timeout(Duration::from_secs(20))
+    .hook(hook_from_fn("hangs", 10, |_| std::thread::sleep(Duration::from_secs(30))))
+    .hook(hook_from_fn("flush", 0, |reason| assert_eq!(reason, ShutdownReason::Forced)))
     .build();
 
-assert_eq!(coord.signals(), SignalSet::standard());
-assert_eq!(coord.graceful_timeout(), Duration::from_secs(10));
+let report = coord.run_hooks_with_report(ShutdownReason::Requested);
+assert!(report.elapsed() < Duration::from_secs(20));
+assert_eq!(report.outcomes()[0].status, HookStatus::TimedOut);
+assert_eq!(report.outcomes()[1].status, HookStatus::Completed);
+assert_eq!(report.outcomes()[1].phase, Some(HookPhase::Force));
+```
+
+---
+
+## `RunReport`
+
+`#[non_exhaustive]`, `Clone`, `PartialEq`, `Display`.
+
+| Method                                                              | Result                                 |
+| ------------------------------------------------------------------- | -------------------------------------- |
+| `reason()`                                                          | reason passed to the run               |
+| `outcomes() -> &[HookOutcome]`                                      | one entry per hook, execution order    |
+| `elapsed()`                                                         | run duration                           |
+| `completed()`, `panicked()`, `timed_out()`, `skipped()`, `forced()` | counts                                 |
+| `is_clean()`                                                        | every hook completed                   |
+
+## `HookOutcome`
+
+`#[non_exhaustive]` struct with public fields: `name: Arc<str>`,
+`priority`, `status: HookStatus`, `phase: Option<HookPhase>`,
+`duration: Option<Duration>`, `panic_message: Option<String>`.
+
+## `HookStatus`
+
+`Pending`, `Running`, `Completed`, `Panicked`, `TimedOut`, `Skipped`
+(`#[non_exhaustive]`); `is_finished()` is `true` for the last four.
+
+## `HookPhase`
+
+`Graceful` or `Force` (`#[non_exhaustive]`).
+
+## `RunHooksFuture`
+
+Returned by `run_hooks_async`. The first poll starts the run on a
+`signal-mod-shutdown` supervisor thread (or joins a run already in
+progress), so the budgets are measured from that poll, not from the
+`run_hooks_async` call; it resolves with the `RunReport`. `'static`, `Send`, any
+executor. Dropping it does not cancel a started run.
+
+```rust
+# #[tokio::main]
+# async fn main() {
+use signal_mod::{Coordinator, ShutdownReason, hook_from_fn};
+
+let coord = Coordinator::builder()
+    .hook(hook_from_fn("boom", 0, |_| panic!("disk on fire")))
+    .build();
+let report = coord.run_hooks_async(ShutdownReason::Requested).await;
+assert_eq!(report.panicked(), 1);
+assert_eq!(report.outcomes()[0].panic_message.as_deref(), Some("disk on fire"));
+println!("{report}");
+# }
 ```
 
 ---
 
 ## `Statistics`
 
+`#[non_exhaustive]` snapshot with public fields: `initiated`, `reason`,
+`elapsed`, `hooks_registered`, `hooks_completed`, `hooks_panicked`,
+`hooks_timed_out`, `hooks_skipped`, `hooks: Vec<HookOutcome>` (live
+per-hook status and timings), `installed`, `active_subsystems`.
+
+`initiated`, `reason` and `elapsed` come from one atomic publication
+(`initiated == reason.is_some()` always holds). Per-hook entries are read
+one at a time from atomics, so `statistics()` never waits for a running
+hook.
+
 ```rust
-#[derive(Debug, Clone)]
-pub struct Statistics {
-    pub initiated: bool,
-    pub reason: Option<ShutdownReason>,
-    pub hooks_registered: usize,
-    pub hooks_completed: usize,
-    pub elapsed: Option<Duration>,
+use signal_mod::{Coordinator, HookStatus, ShutdownReason, hook_from_fn};
+
+let coord = Coordinator::builder().hook(hook_from_fn("h", 0, |_| {})).build();
+assert_eq!(coord.statistics().hooks[0].status, HookStatus::Pending);
+coord.run_hooks(ShutdownReason::Requested);
+let stats = coord.statistics();
+assert_eq!(stats.hooks_completed, 1);
+assert!(stats.hooks[0].duration.is_some());
+```
+
+---
+
+## `SignalSubscription`
+
+Created by `Coordinator::subscribe()`. Sees every delivered signal
+(shutdown and notify sets) from the moment it is created. Like the OS,
+it coalesces repeats of a signal that arrive before you receive it;
+distinct pending signals come out in canonical order. Memory is one bit
+per signal; nothing is dropped silently.
+
+| Method            | Behavior                                               |
+| ----------------- | ------------------------------------------------------ |
+| `recv()`          | [`Recv`](#recv) future; `None` once closed and drained |
+| `try_recv()`      | pending signal, if any                                 |
+| `recv_blocking()` | block until a signal arrives (or closed)               |
+| `recv_timeout(d)` | block at most `d`                                      |
+| `is_closed()`     | the coordinator and its listeners are gone             |
+
+```rust
+use signal_mod::{Coordinator, Signal, SignalSet};
+
+let coord = Coordinator::builder()
+    .signals(SignalSet::graceful() - Signal::Hangup)
+    .notify_signals(SignalSet::empty().with(Signal::Hangup).with(Signal::User1))
+    .build();
+let mut events = coord.subscribe();
+
+coord.simulate_signal(Signal::User1);
+coord.simulate_signal(Signal::Hangup);
+coord.simulate_signal(Signal::Hangup); // coalesced
+assert_eq!(events.try_recv(), Some(Signal::Hangup));
+assert_eq!(events.try_recv(), Some(Signal::User1));
+assert_eq!(events.try_recv(), None);
+assert!(!coord.token().is_initiated());
+```
+
+With a runtime, reload and shutdown fit one `select!` loop:
+
+```rust,no_run
+use signal_mod::{Coordinator, Signal, SignalSet};
+
+#[tokio::main]
+async fn main() -> signal_mod::Result<()> {
+    let coord = Coordinator::builder()
+        .signals(SignalSet::graceful() - Signal::Hangup)
+        .notify_signals(SignalSet::from(Signal::Hangup))
+        .build();
+    coord.install()?;
+    let token = coord.token();
+    let mut events = coord.subscribe();
+    loop {
+        tokio::select! {
+            () = token.wait() => break,
+            Some(Signal::Hangup) = events.recv() => println!("reload"),
+        }
+    }
+    Ok(())
 }
 ```
 
-Snapshot returned by `Coordinator::statistics`. All fields are public
-for direct read access. The snapshot is a value type; later state
-changes on the coordinator do not affect a previously-taken
-snapshot.
+## `Recv`
 
-### Examples
+Future returned by `SignalSubscription::recv`.
+
+---
+
+## `Backend`
+
+`Tokio` or `Agnostic` (`#[non_exhaustive]`), as reported by
+`Coordinator::backend()`.
 
 ```rust
-use signal_mod::{Coordinator, ShutdownReason};
+use signal_mod::{Coordinator, SignalSet};
 
-let coord = Coordinator::builder().build();
-let before = coord.statistics();
-assert!(!before.initiated);
-assert!(before.elapsed.is_none());
-
-coord.trigger().trigger(ShutdownReason::Requested);
-
-let after = coord.statistics();
-assert!(after.initiated);
-assert_eq!(after.reason, Some(ShutdownReason::Requested));
-assert!(after.elapsed.is_some());
+let coord = Coordinator::builder().signals(SignalSet::empty()).build();
+assert_eq!(coord.backend(), None);
 ```
+
+---
+
+## `shutdown_signal`
+
+`shutdown_signal() -> Result<ShutdownSignal>` installs handlers for
+`SignalSet::graceful()` and returns a future that resolves on the first
+one. It is made for `with_graceful_shutdown` APIs (axum, hyper, tonic).
+The handlers live inside the returned value; once the server drops it,
+the default action is back, so a second Ctrl+C terminates even if
+draining hangs.
+
+```rust,no_run
+# async fn serve() -> std::io::Result<()> {
+let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+axum::serve(listener, axum::Router::new())
+    .with_graceful_shutdown(signal_mod::shutdown_signal().map_err(std::io::Error::other)?)
+    .await
+# }
+```
+
+## `ShutdownSignal`
+
+The future returned by `shutdown_signal`; also offers `reason()` and
+`token()`.
 
 ---
 
 ## `Error`
 
-```rust
-#[non_exhaustive]
-#[derive(Debug)]
-pub enum Error {
-    AlreadyInstalled,
-    SignalRegistration {
-        signal: Signal,
-        source: std::io::Error,
-    },
-    InvalidState(&'static str),
-    Timeout(&'static str),
-    NoRuntime,
-}
-```
+`#[non_exhaustive]`; implements `std::error::Error` (with `source()` for
+the OS error) and `Display`.
 
-The error type returned by fallible methods on the public surface.
-Implements `Display` and `std::error::Error`; `Error::source()`
-returns the underlying `io::Error` for `SignalRegistration`.
-
-The enum is `#[non_exhaustive]`. New variants may be added in `1.x`
-minor releases; downstream `match`es must include a wildcard arm.
-
-### Variant semantics
-
-| Variant                                                       | Triggered by                                                                          |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `AlreadyInstalled`                                            | Second `Coordinator::install` on the same coordinator.                                |
-| `SignalRegistration { signal, source }`                       | Platform rejected handler registration for a specific signal. `source` is the OS error. |
-| `InvalidState(&'static str)`                                  | Reserved for future use.                                                              |
-| `Timeout(&'static str)`                                       | Reserved for future use.                                                              |
-| `NoRuntime`                                                   | `install` called with no back-end feature enabled.                                    |
-
-### Examples
+| Variant                                 | Meaning and what to do                                                      |
+| --------------------------------------- | --------------------------------------------------------------------------- |
+| `AlreadyInstalled`                      | this coordinator is installed; `uninstall()` first to replace it             |
+| `SignalRegistration { signal, source }` | the OS rejected `signal`, or the Tokio runtime has no I/O driver (`enable_all`) |
+| `NoRuntime`                             | no back-end feature enabled; enable `tokio` or `agnostic`                    |
+| `OutsideTokioRuntime`                   | only `tokio` enabled and called outside a runtime; call inside it or enable `agnostic` |
+| `ListenerThread(io::Error)`             | the listener could not start (Unix thread or self-pipe, Windows console handler registration); retry |
+| `InvalidState`, `Timeout`               | deprecated since 2.0.0, never produced, removed in 3.0                       |
 
 ```rust
 use signal_mod::{Coordinator, Error};
 
-# #[cfg(feature = "tokio")]
-# async fn run() {
 let coord = Coordinator::builder().build();
 match coord.install() {
-    Ok(()) => println!("installed"),
-    Err(Error::AlreadyInstalled) => println!("already installed"),
-    Err(Error::SignalRegistration { signal, source }) => {
-        eprintln!("failed to install {signal:?}: {source}")
-    }
-    Err(Error::NoRuntime) => eprintln!("no runtime feature enabled"),
-    Err(other) => eprintln!("install failed: {other}"),
+    Ok(()) => assert!(coord.uninstall()),
+    Err(Error::OutsideTokioRuntime | Error::NoRuntime) => {} // no back-end usable here
+    Err(other) => panic!("unexpected: {other}"),
 }
-# }
 ```
-
----
 
 ## `Result`
 
-```rust
-pub type Result<T> = core::result::Result<T, Error>;
-```
-
-Convenience alias used by every fallible method on the public
-surface.
-
----
+`pub type Result<T> = core::result::Result<T, Error>;`
 
 ## `VERSION`
 
 ```rust
-pub const VERSION: &str;
-```
-
-The crate version string, populated by Cargo at build time. Useful
-for log lines, telemetry, and version-aware integrations.
-
-### Examples
-
-```rust
-use signal_mod::VERSION;
-
-println!("signal-mod {VERSION}");
-assert!(!VERSION.is_empty());
+assert_eq!(signal_mod::VERSION, env!("CARGO_PKG_VERSION"));
 ```
 
 ---
 
-## Cargo features
+## Platform behavior
 
-| Feature          | Default | Effect                                                                                |
-| ---------------- | ------- | ------------------------------------------------------------------------------------- |
-| `std`            | yes     | Enables std-dependent items. Reserved for a future `no_std` story.                    |
-| `tokio`          | yes     | Tokio runtime adapter; enables async `wait()` and signal handlers via `tokio::signal`. |
-| `async-std`      | no      | async-std runtime adapter; uses `signal-hook-async-std` on Unix and `ctrlc` on Windows. |
-| `ctrlc-fallback` | no      | Synchronous `ctrlc::set_handler` fallback covering `Signal::Interrupt`.               |
+**Unix.** Numbers come from `libc` for the compiled target. The Tokio
+back-end uses `tokio::signal::unix`; the agnostic back-end a signal-hook
+iterator thread. Neither library ever removes an OS handler, so for
+shutdown signals that were at their default action before signal-mod
+installed them, signal-mod arms a conditional default action that takes
+over once the last coordinator covering the signal is gone (see
+[`install`](#install)). A second-signal escalation re-raises the signal
+with its default action, so the parent sees a death by that signal.
 
-When both `tokio` and `async-std` are enabled, `tokio` wins.
+**Windows.** With the `tokio` feature, both back-ends use Tokio's
+console-event streams (the agnostic back-end polls them from its
+listener thread, without a runtime), so coordinators and the
+application's own `tokio::signal` listeners share Tokio's one console
+handler and all see every event. Without the `tokio` feature, the
+agnostic back-end registers signal-mod's own console control handler.
+Windows calls console handlers last-registered first and stops at the
+first that claims the event, so that handler hides events from console
+handlers registered earlier by other code (for example the
+application's own Tokio, if it uses one but signal-mod's `tokio` feature
+is off), and a handler registered later by other code can hide events
+from signal-mod. Enable the `tokio` feature whenever the application
+uses `tokio::signal` itself.
+`Interrupt` is Ctrl+C, `Quit` Ctrl+Break, `Terminate` the
+console window closing, `Hangup` logoff or system shutdown (delivered to
+services only). After `CTRL_CLOSE_EVENT` the OS terminates the process
+about 5 seconds later; both back-ends hold the OS handler thread so that
+window is usable, so keep `force_timeout` under it if console close
+matters. `Pipe`, `User1` and `User2` are never delivered and are left out
+of `installed_signals()`.
+
+**Other targets.** `install` succeeds with an empty `installed_signals()`.
 
 ---
 
 ## Performance
 
-Measured on a single reference platform (Windows 11,
-`x86_64-pc-windows-msvc`, Rust 1.95.0) via
-`cargo bench --bench shutdown_bench`. Rerun locally to validate on
-your hardware. Lower is better.
-
-| Operation                                       | Median time |
-| ----------------------------------------------- | ----------- |
-| `ShutdownToken::is_initiated` (uninitiated)     | 364 ps      |
-| `ShutdownTrigger::trigger` (state transition)   | 123 ns      |
-| `ShutdownTrigger::trigger` (already initiated)  | 4.7 ns      |
-| `ShutdownToken::clone`                          | 7.2 ns      |
-| `Coordinator::run_hooks` (1 hook)               | 60 ns       |
-| `Coordinator::run_hooks` (4 hooks)              | 156 ns      |
-| `Coordinator::run_hooks` (16 hooks)             | 536 ns      |
-| `Coordinator::run_hooks` (64 hooks)             | 2.08 us     |
-| `SignalSet::iter` (all 7 variants)              | 1.5 ns      |
-
-Notes:
-
-- `is_initiated` is one relaxed atomic load, one `mov` on x86-64.
-- `trigger` on the already-initiated path is one failing
-  `compare_exchange`; no lock, no broadcast.
-- `run_hooks` scales linearly in the number of hooks. Sort overhead
-  is dominated by per-hook dispatch.
-- `wait_blocking_timeout` with sub-millisecond budgets measures OS
-  timer granularity (~15 ms on Windows), not the primitive itself.
+`cargo bench --bench shutdown_bench`; numbers and conditions are in the
+[README](../README.md#performance). The observer hot paths
+(`is_initiated`, `reason`, polling a ready `wait()` future) are
+lock-free loads. A coordinator with hooks parks one standby worker
+thread when it is built (the README lists what `build()` costs), so a
+hook run does not pay for a thread spawn: it costs one hand-off to that
+thread and one wake-up of the caller, once per coordinator run. Hooks
+that finish in time add no context switch each.
 
 ---
 
-## Copyright
-
-Copyright (C) 2026 James Gober. Licensed under Apache-2.0.
+Copyright (C) 2026 James Gober. Licensed under Apache-2.0 OR MIT.

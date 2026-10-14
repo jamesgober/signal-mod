@@ -1,91 +1,138 @@
-//! Tokio back-end for [`Coordinator::install`](crate::Coordinator::install).
+//! Tokio back-end.
 //!
-//! Spawns one background task per configured signal. Each task drives
-//! the corresponding `tokio::signal` stream and calls
-//! [`ShutdownTrigger::trigger`](crate::ShutdownTrigger::trigger) when
-//! a signal is delivered. Tasks live until the runtime shuts them down.
+//! - **Unix:** one `tokio::signal` listener task per signal. Registration
+//!   is all-or-nothing: every stream is created before any task is
+//!   spawned, so a failure part-way leaves nothing behind (1.0.0 left the
+//!   earlier listeners running). Uninstalling aborts the tasks; because
+//!   Tokio never removes its OS handler, [`restore`](super::restore)
+//!   brings back the default action where that was the prior one.
+//! - **Windows:** one `tokio::signal::windows` listener task per console
+//!   event. Tokio's console handler broadcasts each event to every Tokio
+//!   listener in the process, so coordinators and the application's own
+//!   `tokio::signal` listeners all see it. Uninstalling drops the
+//!   streams; once nothing listens, Tokio's handler declines the event
+//!   and the OS default (terminate) applies.
 
-use crate::coord::Coordinator;
-use crate::error::{Error, Result};
-use crate::reason::ShutdownReason;
-use crate::signal::{Signal, SignalSet};
-use crate::token::ShutdownTrigger;
+use std::sync::Arc;
 
-/// Install Tokio-backed signal listeners for the configured set.
-///
-/// Must be called from inside a Tokio runtime context (`tokio::main`,
-/// `tokio::test`, or an explicit `Runtime::handle().enter()` block);
-/// otherwise `tokio::spawn` panics.
-pub(crate) fn install(coord: &Coordinator) -> Result<()> {
-    let trigger = coord.trigger();
-    let set = coord.signals();
-    install_inner(set, trigger)
+use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
+
+use crate::dispatch::Dispatcher;
+use crate::error::Result;
+use crate::signal::SignalSet;
+
+/// Running listener tasks.
+#[derive(Debug)]
+pub(crate) struct Registration {
+    tasks: Vec<JoinHandle<()>>,
+    covered: SignalSet,
+    /// Signals counted by [`restore::acquire`](super::restore::acquire).
+    #[cfg(unix)]
+    restored: SignalSet,
+}
+
+impl Registration {
+    pub(crate) fn covered(&self) -> SignalSet {
+        self.covered
+    }
+
+    pub(crate) fn uninstall(self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        #[cfg(unix)]
+        super::restore::release(self.restored);
+        sm_debug!(signals = ?self.covered, "tokio signal listeners removed");
+    }
 }
 
 #[cfg(unix)]
-fn install_inner(set: SignalSet, trigger: ShutdownTrigger) -> Result<()> {
-    use tokio::signal::unix::{signal, SignalKind};
+pub(crate) fn install(
+    handle: &Handle,
+    dispatcher: &Arc<Dispatcher>,
+    set: SignalSet,
+) -> Result<Registration> {
+    use tokio::signal::unix::{SignalKind, signal};
 
-    fn reg(sig: Signal, kind: SignalKind, set: SignalSet, trigger: &ShutdownTrigger) -> Result<()> {
-        if !set.contains(sig) {
-            return Ok(());
-        }
-        let mut stream = signal(kind).map_err(|e| Error::SignalRegistration {
-            signal: sig,
-            source: e,
-        })?;
-        let t = trigger.clone();
-        tokio::spawn(async move {
-            while stream.recv().await.is_some() {
-                let _ = t.trigger(ShutdownReason::Signal(sig));
-            }
+    let _context = handle.enter();
+    // Read the prior dispositions before Tokio registers anything.
+    let restored = super::restore::acquire(set, dispatcher.shutdown_set())
+        .map_err(|(sig, e)| super::registration_error(sig, e))?;
+    let mut streams = Vec::with_capacity(set.len());
+    for sig in set {
+        let Some(number) = sig.unix_number() else {
+            continue;
+        };
+        let kind = SignalKind::from_raw(number);
+        // `signal` panics instead of erroring when the runtime was built
+        // without its I/O driver; turn that into a registration error.
+        let created = std::panic::catch_unwind(move || signal(kind)).unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "the Tokio runtime has no signal driver; build it with enable_io() or enable_all()",
+            ))
         });
-        Ok(())
+        match created {
+            Ok(stream) => streams.push((sig, stream)),
+            Err(e) => {
+                super::restore::release(restored);
+                return Err(super::registration_error(sig, e));
+            }
+        }
     }
 
-    reg(Signal::Terminate, SignalKind::terminate(), set, &trigger)?;
-    reg(Signal::Interrupt, SignalKind::interrupt(), set, &trigger)?;
-    reg(Signal::Quit, SignalKind::quit(), set, &trigger)?;
-    reg(Signal::Hangup, SignalKind::hangup(), set, &trigger)?;
-    reg(Signal::Pipe, SignalKind::pipe(), set, &trigger)?;
-    reg(Signal::User1, SignalKind::user_defined1(), set, &trigger)?;
-    reg(Signal::User2, SignalKind::user_defined2(), set, &trigger)?;
-    Ok(())
+    let tasks = streams
+        .into_iter()
+        .map(|(sig, mut stream)| {
+            let dispatcher = Arc::clone(dispatcher);
+            handle.spawn(async move {
+                while stream.recv().await.is_some() {
+                    dispatcher.deliver(sig);
+                }
+            })
+        })
+        .collect();
+    sm_debug!(signals = ?set, "tokio signal listeners installed");
+    Ok(Registration {
+        tasks,
+        covered: set,
+        restored,
+    })
 }
 
 #[cfg(windows)]
-fn install_inner(set: SignalSet, trigger: ShutdownTrigger) -> Result<()> {
-    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
-
-    macro_rules! spawn_listener {
-        ($sig:expr, $factory:expr) => {{
-            if set.contains($sig) {
-                let mut s = $factory().map_err(|e| Error::SignalRegistration {
-                    signal: $sig,
-                    source: e,
-                })?;
-                let t = trigger.clone();
-                tokio::spawn(async move {
-                    while s.recv().await.is_some() {
-                        let _ = t.trigger(ShutdownReason::Signal($sig));
-                    }
-                });
-            }
-        }};
-    }
-
-    spawn_listener!(Signal::Interrupt, ctrl_c);
-    spawn_listener!(Signal::Quit, ctrl_break);
-    spawn_listener!(Signal::Terminate, ctrl_close);
-    spawn_listener!(Signal::Hangup, ctrl_shutdown);
-    // Pipe / User1 / User2 are inert on Windows; skip silently.
-    let _ = trigger;
-    Ok(())
+pub(crate) fn install(
+    handle: &Handle,
+    dispatcher: &Arc<Dispatcher>,
+    set: SignalSet,
+) -> Result<Registration> {
+    let covered = set.available_on_current_platform();
+    let tasks = super::windows_events::streams(covered)?
+        .into_iter()
+        .map(|(sig, mut stream)| {
+            let dispatcher = Arc::clone(dispatcher);
+            handle.spawn(async move {
+                while stream.recv().await.is_some() {
+                    dispatcher.deliver(sig);
+                }
+            })
+        })
+        .collect();
+    sm_debug!(signals = ?covered, "tokio console-event listeners installed");
+    Ok(Registration { tasks, covered })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn install_inner(_set: SignalSet, _trigger: ShutdownTrigger) -> Result<()> {
-    // Unknown platform. We have no signal back-end; treat install as
-    // a successful no-op so the rest of the API stays usable.
-    Ok(())
+pub(crate) fn install(
+    _handle: &Handle,
+    _dispatcher: &Arc<Dispatcher>,
+    _set: SignalSet,
+) -> Result<Registration> {
+    // No signal source on this platform: an explicit, empty
+    // installation (`Coordinator::installed_signals` reports it).
+    sm_warn!("no signal source on this platform; install() covers no signals");
+    Ok(Registration {
+        tasks: Vec::new(),
+        covered: SignalSet::empty(),
+    })
 }

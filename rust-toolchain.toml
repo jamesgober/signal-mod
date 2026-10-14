@@ -1,0 +1,13 @@
+# Pinned per REPS (Reproducibility & Build Determinism): the toolchain
+# this release was developed and verified with. It is not the MSRV
+# (1.85, declared in Cargo.toml): the benchmark harness (criterion 0.8)
+# needs 1.86, and cargo-semver-checks needs a recent stable. The MSRV is
+# enforced separately (`cargo +1.85 check`, and the CI `msrv` job).
+#
+# CI uses the same pinned toolchain for linting and tests (bump both
+# together, deliberately, since lints are deny-by-default); its MSRV job
+# runs 1.85 and its docs.rs / sanitizer jobs run nightly.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

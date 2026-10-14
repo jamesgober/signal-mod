@@ -1,16 +1,16 @@
 [package]
 name = "signal-mod"
-version = "1.0.0"
-edition = "2021"
-rust-version = "1.75"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.85"
 readme = "README.md"
-license = "Apache-2.0"
+license = "Apache-2.0 OR MIT"
 
 authors = [
     "James Gober <me@jamesgober.com>"
 ]
 
-description = "Cross-platform OS signal handling and graceful-shutdown orchestration for Rust. One API for SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGPIPE, SIGUSR1, SIGUSR2 and the Windows console control events, with cloneable observer and initiator handles, priority-ordered shutdown hooks, and optional adapters for the Tokio and async-std runtimes."
+description = "Cross-platform OS signal handling and graceful-shutdown orchestration for Rust. One API for SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGPIPE, SIGUSR1, SIGUSR2 and the Windows console control events: cloneable observer and initiator handles, priority-ordered shutdown hooks with enforced deadlines, reload-style signal subscriptions, and Tokio or runtime-agnostic back-ends."
 
 # crates.io enforces 5 keywords max, each up to 20 chars, alphanumeric
 # plus `-` / `_`. Optimized for search intent: signal handling,
@@ -39,48 +39,33 @@ documentation = "https://docs.rs/signal-mod"
 repository    = "https://github.com/jamesgober/signal-mod"
 homepage      = "https://github.com/jamesgober/signal-mod"
 
+# Ship the library, its user-facing docs, examples and tests; keep repo
+# tooling (CI, lint configs, release notes, planning files) out of the
+# published crate.
+include = [
+    "/src/**/*.rs",
+    "/tests/**/*.rs",
+    "/benches/**/*.rs",
+    "/examples/**/*.rs",
+    "/docs/API.md",
+    "/docs/MIGRATION.md",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+]
+
 [package.metadata.docs.rs]
-# Build with the realistic feature set: std + tokio + ctrlc-fallback.
-# The `async-std` feature is excluded because its transitive
-# `rustix 0.37.x` uses internal `rustc_*` attributes that current
-# docs.rs nightly rejects (same root cause as the `proc-daemon`
-# v1.1.1 docs.rs patch). Users who need `async-std` continue to
-# build it locally with `--features async-std`.
-features = ["std", "tokio", "ctrlc-fallback"]
+# Every back-end documents on docs.rs: no feature depends on the
+# async-std crate (and its rustix 0.37 tree) any more.
+all-features = true
 default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 name = "signal_mod"
 path = "src/lib.rs"
-
-[dependencies]
-parking_lot = "0.12"
-
-# Optional async runtimes. Exactly one is expected at a time; if
-# both are enabled, `tokio` wins.
-tokio = { version = "1.40", default-features = false, features = [
-    "sync",
-    "signal",
-    "rt",
-    "time",
-    "macros",
-], optional = true }
-
-async-std = { version = "1.12", optional = true }
-futures = { version = "0.3", optional = true }
-
-# Synchronous Ctrl+C fallback when no async runtime is selected.
-ctrlc = { version = "3.4", optional = true }
-
-[target.'cfg(unix)'.dependencies]
-signal-hook = { version = "0.3", optional = true }
-signal-hook-async-std = { version = "0.2", optional = true }
-
-[dev-dependencies]
-tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time", "sync"] }
-criterion = { version = "0.5", default-features = false }
-proptest = "1"
 
 [features]
 default = ["std", "tokio"]
@@ -89,28 +74,105 @@ default = ["std", "tokio"]
 # `no_std` story can be carved out without a breaking change.
 std = []
 
-# Tokio runtime adapter. Installs signal listeners on the active
-# Tokio runtime; enables `ShutdownToken::wait().await`.
-tokio = ["dep:tokio"]
+# Tokio back-end. `Coordinator::install` called inside a Tokio runtime
+# spawns one listener task per signal via `tokio::signal`. On Unix,
+# `signal-hook` restores a default disposition after uninstall. With this
+# feature the agnostic back-end also uses Tokio's console-event streams
+# on Windows, so every listener in the process shares one handler.
+tokio = ["dep:tokio", "dep:signal-hook"]
 
-# async-std runtime adapter. Uses `signal-hook-async-std` on Unix and
-# `ctrlc` as the Windows back-end (async-std lacks a native Windows
-# signal stream).
-async-std = [
-    "dep:async-std",
-    "dep:futures",
-    "dep:signal-hook",
-    "dep:signal-hook-async-std",
-    "dep:ctrlc",
-]
+# Runtime-agnostic back-end. Signals feed the runtime-agnostic
+# `ShutdownToken::wait` future, so it works under smol, async-std, any
+# other executor, or plain threads. Unix: a signal-hook listener thread.
+# Windows: a console control handler registered through windows-sys.
+agnostic = ["dep:signal-hook", "dep:windows-sys"]
 
-# Synchronous `ctrlc` fallback. Lets `Coordinator::install` register a
-# handler when no async runtime feature is enabled (covers
-# `Signal::Interrupt`).
-ctrlc-fallback = ["dep:ctrlc"]
+# Convenience alias for smol users: the agnostic back-end.
+smol = ["agnostic"]
+
+# Kept for 1.x compatibility: an alias of the agnostic back-end, which
+# covers every signal in the set instead of Ctrl+C only.
+ctrlc-fallback = ["agnostic"]
+
+# Deprecated since 2.0.0 (async-std is discontinued, RUSTSEC-2025-0052).
+# An alias of the agnostic back-end; it no longer depends on async-std.
+async-std = ["agnostic"]
+
+# Structured diagnostics through `tracing`: signal delivery, install and
+# uninstall, hook start / finish / panic / timeout, escalation.
+tracing = ["dep:tracing"]
+
+# `ShutdownToken::cancellation_token` and
+# `From<&ShutdownToken> for tokio_util::sync::CancellationToken`.
+tokio-util = ["dep:tokio-util"]
+
+[dependencies]
+# Optional (feature `tokio`). The Tokio back-end: `rt` to spawn the
+# listener tasks and to hand hooks the caller's runtime context,
+# `signal` for the per-signal streams. No macros, no timers.
+tokio = { version = "1.47", optional = true, default-features = false, features = ["rt", "signal"] }
+
+# Optional (feature `tracing`). The de-facto structured logging facade;
+# no default features (no `attributes` proc-macro).
+tracing = { version = "0.1.41", optional = true, default-features = false, features = ["std"] }
+
+# Optional (feature `tokio-util`). Only `sync::CancellationToken` is used.
+tokio-util = { version = "0.7.13", optional = true, default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+# Per-target signal numbers (`SIGUSR1` is 10 on Linux, 30 on macOS and
+# the BSDs, 16 on MIPS Linux). Already in every Tokio build on Unix.
+libc = "0.2.155"
+
+# Optional (features `tokio`, `agnostic`). The agnostic back-end's
+# listener iterator, and conditional default dispositions so that an
+# uninstalled coordinator does not leave signals swallowed.
+signal-hook = { version = "0.4", optional = true, default-features = false, features = ["iterator"] }
+
+[target.'cfg(windows)'.dependencies]
+# Optional (feature `agnostic`). `SetConsoleCtrlHandler`, for the
+# agnostic back-end's own console handler when the `tokio` feature (and
+# with it Tokio's shared handler) is not enabled. Already in every Tokio
+# build on Windows.
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[dev-dependencies]
+# Benchmark harness. Default features off: no rayon / plotters.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[target.'cfg(not(loom))'.dev-dependencies]
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+tokio-util = { version = "0.7.13", default-features = false }
+# Property tests required by REPS. `std` only: no fork / timeout machinery.
+proptest = { version = "1.6", default-features = false, features = ["std"] }
+# Examples only: graceful shutdown of an HTTP server, and the smol runtime.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+smol = "2"
+
+[target.'cfg(all(unix, not(loom)))'.dev-dependencies]
+# Real-signal integration tests raise signals inside a child process,
+# register foreign handlers and set SIG_IGN.
+signal-hook = { version = "0.4", default-features = false }
+libc = "0.2.155"
+
+[target.'cfg(all(windows, not(loom)))'.dev-dependencies]
+# Real console-event integration test (`GenerateConsoleCtrlEvent`).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+
+# Model checker for the shutdown state machine. Only resolved for
+# `RUSTFLAGS="--cfg loom" cargo test --lib --release ... loom`.
+[target.'cfg(loom)'.dev-dependencies]
+loom = { version = "0.7", features = ["futures"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(docsrs)"] }
 
 [[bench]]
 name = "shutdown_bench"
+harness = false
+
+[[test]]
+name = "real_signals"
 harness = false
 
 [profile.release]
