@@ -252,6 +252,17 @@ every back-end. Raising it is a breaking change and requires a major
 version. The repository's `rust-toolchain.toml` pins the development
 toolchain separately (dev-dependencies such as criterion need newer).
 
+Lockfile and toolchain policy: `Cargo.lock` is committed and every CI
+job builds with `--locked`, so CI fails only because of new commits,
+not because a dependency released. A library's lockfile does not affect
+dependents (only `Cargo.toml` does), and `rust-toolchain.toml` only
+applies to builds inside this repository; it is not in the published
+package. CI selects every non-pinned toolchain (MSRV, nightly, stable)
+explicitly through `RUSTUP_TOOLCHAIN` and prints `rustc -V`. The
+`latest-deps` workflow (weekly and on pull requests) runs `cargo update`
+and then clippy, tests, an MSRV check and `cargo audit`, to catch what a
+fresh dependent would resolve.
+
 ## 7. Performance contract
 
 - `ShutdownToken::is_initiated` is one `Acquire` load; `reason` and
@@ -263,7 +274,9 @@ toolchain separately (dev-dependencies such as criterion need newer).
   worker thread when hooks are registered. A hook run hands off to it
   (a fresh thread after a timed-out hook, or in a forked child) and does
   not context switch per hook while hooks finish in time.
-  `force_timeout` is a hard upper bound on a run.
+  `force_timeout` is a hard upper bound on a run, except when the OS
+  refuses to create a thread (the remaining hooks then run inline and
+  cannot be abandoned).
 - Every number in the README is produced by `benches/shutdown_bench.rs`.
 
 ## 8. Stability guarantees

@@ -32,7 +32,11 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   moment the `run_hooks*` call starts the run, everything (including
   the hand-off to the worker thread) counts against them, and
   `force_timeout` is a hard upper bound on the run. A worker thread that
-  does not start within 250 ms is replaced (SM2-002, SM2-016).
+  does not start within 250 ms is replaced (SM2-002, SM2-016). The one
+  exception, documented: if the OS refuses to create a thread, the
+  remaining hooks run inline and a hook that never returns cannot be
+  abandoned (SM2-021). `run_hooks_async` starts the run, and the
+  budgets, at the future's first poll (SM2-022).
   `force_timeout` was previously stored but unused (SM-002, D1, D2).
 - `HookContext::current()` inside a hook: `deadline()`, `remaining()`,
   `is_abandoned()`, so long hooks can cooperate with the deadline
@@ -151,6 +155,12 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   together with `rust-toolchain.toml`) (SM2-001, SM2-011). The semver job
   compares against the latest crates.io release: every feature from
   2.0.0 on, the features shared with 1.x until then (SM2-018).
+- `Cargo.lock` stays committed and every CI job builds with `--locked`;
+  each job prints the toolchain it runs, and the jobs that are not on
+  the pinned toolchain (MSRV, nightly, semver) select theirs explicitly
+  through `RUSTUP_TOOLCHAIN`. New `latest-deps` workflow (weekly and on
+  pull requests): `cargo update`, then clippy and tests on Linux, macOS
+  and Windows, an MSRV library check, `cargo audit` and `cargo deny`.
 - Benchmarks for `Coordinator::builder().build()` with and without hooks
   (SM2-020).
 

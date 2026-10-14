@@ -289,6 +289,11 @@ impl Coordinator {
     ///   start (for example a standby thread lost to `fork`), another
     ///   one is started. The call returns within `force_timeout` plus
     ///   scheduling noise, whatever the hooks or threads do.
+    /// - One exception: if the OS refuses to create a thread (resource
+    ///   exhaustion), the remaining hooks run inline on the calling
+    ///   thread. They still start only within the budgets, but a hook
+    ///   that never returns can then not be abandoned (logged under the
+    ///   `tracing` feature).
     /// - A panicking hook is reported `Panicked` with its message and
     ///   does not stop the run.
     /// - **Run-once:** the first call runs the hooks. Every other call,
@@ -335,6 +340,9 @@ impl Coordinator {
     /// runtime stays free to drive that work (1.x documented this
     /// bridge, but `run_hooks` called from `#[tokio::main]` made it
     /// panic).
+    ///
+    /// The run starts when the future is first polled, not when this
+    /// method is called: both budgets are measured from that poll.
     ///
     /// The future is `'static` and `Send`. Dropping it does not cancel a
     /// run that has started.

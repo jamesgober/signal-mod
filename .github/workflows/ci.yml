@@ -23,6 +23,8 @@ jobs:
         with:
           toolchain: "1.99.0"
           components: rustfmt
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
       - run: cargo fmt --all -- --check
 
   test:
@@ -47,6 +49,8 @@ jobs:
         with:
           toolchain: "1.99.0"
           components: clippy
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
@@ -73,6 +77,8 @@ jobs:
         with:
           toolchain: "1.99.0"
           components: clippy
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
       - uses: Swatinem/rust-cache@v2
       - name: Clippy and test every feature on its own
         shell: bash
@@ -103,6 +109,8 @@ jobs:
           toolchain: "1.99.0"
           components: clippy
           targets: ${{ matrix.target }}
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (library, every back-end)
         run: |
@@ -119,6 +127,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.85
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
       - uses: Swatinem/rust-cache@v2
       # The library (what downstream users build) for every back-end.
       # Dev-dependencies are excluded: the benchmark harness needs 1.86.
@@ -137,12 +147,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.0"
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
       - uses: Swatinem/rust-cache@v2
       - name: rustdoc (stable, all features)
         run: cargo doc --locked --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
       - uses: dtolnay/rust-toolchain@nightly
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
+        env:
+          RUSTUP_TOOLCHAIN: nightly
       - name: rustdoc (docs.rs configuration)
         run: cargo doc --locked --all-features --no-deps
         env:
@@ -157,9 +173,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.0"
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
       - uses: Swatinem/rust-cache@v2
       - name: Loom
-        run: cargo test --lib --release --no-default-features --features std loom
+        run: cargo test --locked --lib --release --no-default-features --features std loom
         env:
           RUSTFLAGS: "--cfg loom"
 
@@ -171,6 +189,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
+        env:
+          RUSTUP_TOOLCHAIN: nightly
       - uses: Swatinem/rust-cache@v2
       # `--target` keeps the sanitizer flags off build scripts and proc
       # macros; `-Zbuild-std` instruments the standard library too.
@@ -215,6 +237,8 @@ jobs:
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           feature-group: all-features
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
 
   security:
     name: Security (audit + deny)
@@ -224,6 +248,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.0"
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny

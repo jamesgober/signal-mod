@@ -346,6 +346,16 @@ cargo bench --bench shutdown_bench
 Rust 1.85. Raising it is a breaking change and needs a major version.
 
 
+## Development
+
+`Cargo.lock` is committed and `rust-toolchain.toml` pins the toolchain
+used for lints, formatting and tests (currently 1.99.0, bumped
+deliberately). Neither affects crates that depend on signal-mod: Cargo
+ignores a dependency's lockfile, and the toolchain file only applies
+inside this repository. A weekly `latest-deps` CI job runs against
+freshly resolved dependencies to catch drift.
+
+
 ## Contributing
 
 Issues and pull requests are welcome at

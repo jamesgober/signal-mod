@@ -575,7 +575,10 @@ it), and the next hook starts on a fresh worker. A worker that does not
 start within 250 ms (for example the standby thread, which does not
 survive a `fork` after `build()`) is replaced. So a run returns within
 `force_timeout` (plus scheduling noise) whatever the hooks or threads
-do. `Duration::MAX` budgets disable the deadlines.
+do. The one exception: if the OS refuses to create a thread (resource
+exhaustion), the remaining hooks run inline on the calling thread; they
+still start only within the budgets, but a hook that never returns can
+then not be abandoned. `Duration::MAX` budgets disable the deadlines.
 
 `build()` starts the parked standby worker when hooks are registered; it
 uses no CPU and exits when the coordinator is dropped or after the run.
@@ -640,7 +643,8 @@ assert_eq!(report.outcomes()[1].phase, Some(HookPhase::Force));
 
 Returned by `run_hooks_async`. The first poll starts the run on a
 `signal-mod-shutdown` supervisor thread (or joins a run already in
-progress); it resolves with the `RunReport`. `'static`, `Send`, any
+progress), so the budgets are measured from that poll, not from the
+`run_hooks_async` call; it resolves with the `RunReport`. `'static`, `Send`, any
 executor. Dropping it does not cancel a started run.
 
 ```rust

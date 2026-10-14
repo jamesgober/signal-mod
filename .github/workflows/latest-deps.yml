@@ -1,0 +1,85 @@
+name: Latest dependencies
+
+# CI proper builds with the committed Cargo.lock (`--locked`), so it only
+# fails because of new commits. This workflow resolves the newest
+# semver-compatible dependencies instead, as a new dependent would, so
+# that upstream drift (a breaking patch release, a new advisory, an MSRV
+# bump) is caught before users report it.
+on:
+  schedule:
+    - cron: "17 5 * * 1" # weekly, Monday 05:17 UTC
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same pinned toolchain as CI, so only the dependencies differ.
+  RUSTUP_TOOLCHAIN: "1.99.0"
+
+jobs:
+  latest:
+    name: Latest dependencies (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          components: clippy
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
+      - name: cargo update
+        run: cargo update --verbose
+      - name: Clippy, test (default, all features, no default features)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in "" "--all-features" "--no-default-features --features std,agnostic"; do
+            echo "::group::[$f]"
+            cargo clippy --all-targets $f -- -D warnings -W clippy::pedantic
+            cargo test $f
+            echo "::endgroup::"
+          done
+
+  latest-msrv:
+    name: Latest dependencies on the MSRV (library)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.85
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
+        env:
+          RUSTUP_TOOLCHAIN: "1.85"
+      # Resolver 3 picks MSRV-compatible versions where they exist; this
+      # checks that what a 1.85 user resolves today still builds.
+      - name: cargo update, check every back-end
+        env:
+          RUSTUP_TOOLCHAIN: "1.85"
+        run: |
+          set -euo pipefail
+          cargo update --verbose
+          for f in "" "--all-features" "--no-default-features --features std,agnostic"; do
+            cargo check --lib $f
+          done
+
+  latest-audit:
+    name: Latest dependencies (audit + deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - run: cargo update --verbose
+      - run: cargo audit
+      - run: cargo deny check
