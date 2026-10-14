@@ -950,10 +950,13 @@ mod tests {
     }
 
     /// A standby worker that never runs, as after `fork` in the child.
-    fn with_dead_standby(r: &HookRunner) {
+    /// The caller keeps the returned receiver alive (nobody reads it)
+    /// until the end of the test, so the hand-off "succeeds" but no hook
+    /// ever starts on it.
+    fn with_dead_standby(r: &HookRunner) -> mpsc::Receiver<Assignment> {
         let (tx, rx) = mpsc::channel::<Assignment>();
-        core::mem::forget(rx);
         *lock(&r.standby) = Some((std::process::id(), tx));
+        rx
     }
 
     // SM2-016: a standby worker that never picks up its assignment must
@@ -961,7 +964,7 @@ mod tests {
     #[test]
     fn test_dead_standby_worker_is_replaced_and_hooks_run() {
         let r = runner(vec![Box::new(hook_from_fn("h", 0, |_| {}))], 5_000, 10_000);
-        with_dead_standby(&r);
+        let _parked = with_dead_standby(&r);
         let start = Instant::now();
         let report = r.run_blocking(ShutdownReason::Requested, &RuntimeContext::default());
         assert_eq!(report.completed(), 1);
@@ -977,7 +980,7 @@ mod tests {
     #[test]
     fn test_force_deadline_bounds_run_when_no_worker_starts() {
         let r = runner(vec![Box::new(hook_from_fn("h", 0, |_| {}))], 50, 100);
-        with_dead_standby(&r);
+        let _parked = with_dead_standby(&r);
         let start = Instant::now();
         let report = r.run_blocking(ShutdownReason::Requested, &RuntimeContext::default());
         assert!(
@@ -991,8 +994,7 @@ mod tests {
     #[test]
     fn test_standby_from_another_process_is_not_used() {
         let r = runner(vec![Box::new(hook_from_fn("h", 0, |_| {}))], 5_000, 10_000);
-        let (tx, rx) = mpsc::channel::<Assignment>();
-        core::mem::forget(rx);
+        let (tx, _parked) = mpsc::channel::<Assignment>();
         *lock(&r.standby) = Some((std::process::id().wrapping_add(1), tx));
         let start = Instant::now();
         let report = r.run_blocking(ShutdownReason::Requested, &RuntimeContext::default());
