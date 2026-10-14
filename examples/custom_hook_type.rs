@@ -1,9 +1,8 @@
-//! Implementing the `ShutdownHook` trait directly.
+//! Implementing `ShutdownHook` directly.
 //!
-//! `hook_from_fn` is the easiest path for one-off closures, but the
-//! trait is open. Implementing it directly lets a hook own state
-//! (e.g. a database handle), customize its `Debug` output, or share
-//! logic across multiple instances.
+//! `hook_from_fn` covers one-off closures. Implementing the trait lets a
+//! hook own state (a connection pool, a file handle), set its own
+//! timeout, and be reused across services.
 //!
 //! Run with:
 //!
@@ -11,15 +10,13 @@
 //! cargo run --example custom_hook_type
 //! ```
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use signal_mod::{Coordinator, ShutdownHook, ShutdownReason};
 
-/// A hook that counts how many times it has been invoked.
-///
-/// Holds an `Arc<AtomicUsize>` so the counter can be observed
-/// externally after `run_hooks` returns.
+/// Counts its invocations so the run-once guarantee is visible.
 struct CountedHook {
     label: String,
     priority: i32,
@@ -35,18 +32,21 @@ impl ShutdownHook for CountedHook {
         self.priority
     }
 
+    fn timeout(&self) -> Option<Duration> {
+        Some(Duration::from_secs(1))
+    }
+
     fn run(&self, reason: ShutdownReason) {
-        let prev = self.counter.fetch_add(1, Ordering::Relaxed);
+        let previous = self.counter.fetch_add(1, Ordering::Relaxed);
         println!(
-            "[{}] hook fired (priority={}, prev_count={}, reason={})",
-            self.label, self.priority, prev, reason,
+            "[{}] ran (priority={}, earlier runs={previous}, reason={reason})",
+            self.label, self.priority,
         );
     }
 }
 
 fn main() {
     let counter = Arc::new(AtomicUsize::new(0));
-
     let coord = Coordinator::builder()
         .hook(CountedHook {
             label: "primary".into(),
@@ -61,7 +61,8 @@ fn main() {
         .build();
 
     coord.run_hooks(ShutdownReason::Requested);
+    // A second call reports the first run; no hook runs twice.
     coord.run_hooks(ShutdownReason::Forced);
 
-    println!("counter final value = {}", counter.load(Ordering::Relaxed));
+    println!("total hook runs = {}", counter.load(Ordering::Relaxed));
 }

@@ -1,8 +1,7 @@
-//! Hook priority ordering and the graceful timeout budget.
+//! Hook ordering, the enforced graceful budget, and the force phase.
 //!
-//! Shows that hooks run in descending priority order, that
-//! insertion order is preserved within a priority, and that the
-//! graceful timeout bounds the total work done by `run_hooks`.
+//! A hung hook is abandoned when the graceful budget runs out; the hooks
+//! after it still run, in the force phase, with `ShutdownReason::Forced`.
 //!
 //! Run with:
 //!
@@ -12,37 +11,37 @@
 
 use std::time::Duration;
 
-use signal_mod::{hook_from_fn, Coordinator, ShutdownReason};
+use signal_mod::{Coordinator, ShutdownReason, hook_from_fn};
 
 fn main() {
     let coord = Coordinator::builder()
-        .graceful_timeout(Duration::from_secs(2))
-        // High-priority hooks run first.
-        .hook(hook_from_fn("close-listener", 1000, |_| {
-            println!("close-listener (1000): stop accepting new requests");
+        .graceful_timeout(Duration::from_millis(300))
+        .force_timeout(Duration::from_secs(2))
+        .hook(hook_from_fn("close-listener", 1000, |r| {
+            println!("close-listener (1000): stop accepting requests [{r}]");
         }))
-        .hook(hook_from_fn("drain-queues", 500, |_| {
-            println!("drain-queues (500): finish in-flight work");
+        .hook(hook_from_fn("drain-queues", 500, |r| {
+            println!("drain-queues (500): stuck on a dead peer [{r}]");
+            std::thread::sleep(Duration::from_secs(30));
         }))
-        // Equal priority: insertion order preserved.
-        .hook(hook_from_fn("flush-cache", 100, |_| {
-            println!("flush-cache (100): persist hot keys");
+        // Equal priority: registration order is kept.
+        .hook(hook_from_fn("flush-cache", 100, |r| {
+            println!("flush-cache (100): persist hot keys [{r}]");
         }))
-        .hook(hook_from_fn("flush-logs", 100, |_| {
-            println!("flush-logs (100): rotate and fsync log files");
-        }))
-        // Lowest priority runs last.
-        .hook(hook_from_fn("release-resources", 0, |_| {
-            println!("release-resources (0): close handles, free pools");
+        .hook(hook_from_fn("flush-logs", 100, |r| {
+            println!("flush-logs (100): fsync [{r}]");
         }))
         .build();
 
-    println!("triggering programmatic shutdown");
     coord.trigger().trigger(ShutdownReason::Requested);
-    let ran = coord.run_hooks(ShutdownReason::Requested);
-    let stats = coord.statistics();
-    println!(
-        "ran {ran} of {} registered hook(s); cumulative completions = {}",
-        stats.hooks_registered, stats.hooks_completed,
-    );
+    let report = coord.run_hooks_with_report(ShutdownReason::Requested);
+    println!("\n{report}");
+    for hook in report.outcomes() {
+        println!(
+            "  {:<15} {:<10} phase={:?} took={:?}",
+            hook.name, hook.status, hook.phase, hook.duration
+        );
+    }
+    // The abandoned `drain-queues` thread does not keep the process alive.
+    std::process::exit(0);
 }

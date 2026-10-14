@@ -1,9 +1,9 @@
-//! Multi-subsystem fan-out: one coordinator, many observer tasks.
+//! One coordinator, many subsystems: fan-out on shutdown, then wait
+//! until every subsystem has actually stopped.
 //!
-//! Each "subsystem" gets its own `ShutdownToken` clone and runs an
-//! independent main loop. When the coordinator's shutdown is
-//! initiated, every subsystem wakes from its own `wait().await`
-//! simultaneously.
+//! Each subsystem holds a `SubsystemGuard` while it runs. After shutdown
+//! is initiated, `subsystems_finished()` resolves once every guard is
+//! dropped, which is the point where it is safe to run the final hooks.
 //!
 //! Run with:
 //!
@@ -11,53 +11,44 @@
 //! cargo run --example multi_subsystem
 //! ```
 
-#[cfg(feature = "tokio")]
 use std::time::Duration;
 
-#[cfg(feature = "tokio")]
 use signal_mod::{Coordinator, ShutdownReason, ShutdownToken};
 
-#[cfg(feature = "tokio")]
-async fn subsystem(name: &'static str, token: ShutdownToken) {
-    println!("[{name}] starting; waiting for shutdown");
+async fn subsystem(name: &'static str, token: ShutdownToken, drain: Duration) {
+    let _running = token.subsystem_guard();
+    println!("[{name}] running");
     token.wait().await;
-    println!(
-        "[{name}] shutdown observed (reason={})",
-        token.reason().unwrap_or(ShutdownReason::Requested)
-    );
+    println!("[{name}] draining for {drain:?}");
+    tokio::time::sleep(drain).await;
+    println!("[{name}] stopped");
 }
 
-#[cfg(feature = "tokio")]
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> signal_mod::Result<()> {
+async fn main() {
     let coord = Coordinator::builder().build();
+    let token = coord.token();
 
-    let workers: Vec<&'static str> = vec!["http", "db", "metrics", "scheduler"];
-    let mut handles = Vec::new();
-    for name in workers {
-        let token = coord.token();
-        handles.push(tokio::spawn(subsystem(name, token)));
+    for (name, drain) in [
+        ("http", Duration::from_millis(80)),
+        ("db", Duration::from_millis(40)),
+        ("metrics", Duration::from_millis(10)),
+    ] {
+        drop(tokio::spawn(subsystem(name, token.clone(), drain)));
     }
+    tokio::task::yield_now().await;
 
-    // Drive shutdown after a short delay so every subsystem is in its
-    // wait loop. In a real app this would be `coord.install()?` plus
-    // a real OS signal.
+    // In a real service: `coord.install()?` and an OS signal.
     let trigger = coord.trigger();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
         trigger.trigger(ShutdownReason::Requested);
-    });
+    }));
 
-    for h in handles {
-        h.await.expect("subsystem task panicked");
+    token.wait().await;
+    match tokio::time::timeout(Duration::from_secs(5), token.subsystems_finished()).await {
+        Ok(()) => println!("all subsystems stopped"),
+        Err(_) => println!("{} subsystem(s) still running", token.active_subsystems()),
     }
-
-    let stats = coord.statistics();
-    println!("done. elapsed since trigger: {:?}", stats.elapsed);
-    Ok(())
-}
-
-#[cfg(not(feature = "tokio"))]
-fn main() {
-    eprintln!("This example requires the `tokio` feature.");
+    println!("elapsed since trigger: {:?}", coord.statistics().elapsed);
 }
