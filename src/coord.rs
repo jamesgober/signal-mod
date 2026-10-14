@@ -423,6 +423,11 @@ impl Coordinator {
     /// `#[tokio::main]` and `Runtime::new` enable the driver; custom
     /// builders need `enable_io()` or `enable_all()`.
     ///
+    /// Install after any `fork`: a child process does not inherit the
+    /// listener thread or tasks. Fork safety covers only a coordinator
+    /// that was built: do not install it, wait on its token, or run its
+    /// hooks before forking.
+    ///
     /// # Errors
     ///
     /// - [`Error::AlreadyInstalled`]: this coordinator is installed.
@@ -670,7 +675,8 @@ impl CoordinatorBuilder {
     /// that `fork`s after `build()` does not inherit the thread: the run
     /// in the child detects that and starts a fresh worker. Programs
     /// that daemonize should still build the coordinator after forking,
-    /// as with any multi-threaded set-up.
+    /// as with any multi-threaded set-up. Fork safety covers only a coordinator that was built: do not
+    /// install it, wait on its token, or run its hooks before forking.
     #[must_use]
     pub fn build(self) -> Coordinator {
         let inner = Inner::new();

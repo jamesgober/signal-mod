@@ -582,6 +582,9 @@ then not be abandoned. `Duration::MAX` budgets disable the deadlines.
 
 `build()` starts the parked standby worker when hooks are registered; it
 uses no CPU and exits when the coordinator is dropped or after the run.
+A child forked after `build()` runs its hooks on a fresh worker. Fork safety covers only a coordinator that was
+built: do not install it, wait on its token, or run its hooks before
+forking.
 
 **Run-once.** The first `run_hooks*` call runs the ladder. Every other
 call, concurrent or later, sync or async, waits for that run and returns

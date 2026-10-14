@@ -160,8 +160,10 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   each job prints the toolchain it runs, and the jobs that are not on
   the pinned toolchain (MSRV, nightly, semver) select theirs explicitly
   through `RUSTUP_TOOLCHAIN`. New `latest-deps` workflow (weekly and on
-  pull requests): `cargo update`, then clippy and tests on Linux, macOS
-  and Windows, an MSRV library check, `cargo audit` and `cargo deny`.
+  pull requests): `cargo update` to the true latest versions (ignoring
+  `rust-version`), then clippy and tests on Linux, macOS and Windows,
+  `cargo audit` and `cargo deny`, plus an MSRV-aware update and library
+  check on 1.85.
 - Benchmarks for `Coordinator::builder().build()` with and without hooks
   (SM2-020).
 

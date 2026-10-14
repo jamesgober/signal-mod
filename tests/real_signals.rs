@@ -562,6 +562,108 @@ mod child {
         std::process::exit(0);
     }
 
+    /// Name of the standby worker thread that `build()` parks.
+    #[cfg(unix)]
+    const STANDBY_THREAD: &str = "signal-mod-hook";
+
+    /// Wait (up to 10 s) until the thread named [`STANDBY_THREAD`] exists
+    /// and the kernel reports it blocked, and fail the scenario otherwise.
+    /// Linux and macOS observe the thread's scheduler state; on other
+    /// Unix systems (not run in CI) a pause stands in for it.
+    #[cfg(unix)]
+    fn wait_until_standby_parked() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match standby_parked() {
+                Some(true) => return,
+                Some(false) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Some(false) => fail("the standby worker never parked"),
+                None => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// `Some(true)` when the standby thread exists and is sleeping
+    /// (state `S` in `/proc/self/task/<tid>/stat`).
+    #[cfg(target_os = "linux")]
+    fn standby_parked() -> Option<bool> {
+        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+            return None;
+        };
+        for task in tasks.flatten() {
+            let path = task.path();
+            let name = std::fs::read_to_string(path.join("comm")).unwrap_or_default();
+            if name.trim_end() != STANDBY_THREAD {
+                continue;
+            }
+            let stat = std::fs::read_to_string(path.join("stat")).unwrap_or_default();
+            // `pid (comm) state ...`: the state follows the last `)`.
+            let state = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start());
+            return Some(state.is_some_and(|rest| rest.starts_with('S')));
+        }
+        Some(false)
+    }
+
+    /// `Some(true)` when the standby thread exists and is waiting
+    /// (`TH_STATE_WAITING` through `proc_pidinfo`).
+    #[cfg(target_os = "macos")]
+    fn standby_parked() -> Option<bool> {
+        // `PROC_PIDLISTTHREADS` from <sys/proc_info.h> (not in libc).
+        const PROC_PIDLISTTHREADS: libc::c_int = 6;
+        let pid = libc::c_int::try_from(std::process::id()).ok()?;
+        let mut handles = [0u64; 256];
+        let size = libc::c_int::try_from(core::mem::size_of_val(&handles)).ok()?;
+        // SAFETY: the buffer is valid for `size` bytes for the call.
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADS,
+                0,
+                handles.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        let count = usize::try_from(bytes).ok()? / core::mem::size_of::<u64>();
+        for &handle in handles.iter().take(count) {
+            let mut info = core::mem::MaybeUninit::<libc::proc_threadinfo>::zeroed();
+            let info_size =
+                libc::c_int::try_from(core::mem::size_of::<libc::proc_threadinfo>()).ok()?;
+            // SAFETY: `info` is valid for `info_size` bytes for the call.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTHREADINFO,
+                    handle,
+                    info.as_mut_ptr().cast(),
+                    info_size,
+                )
+            };
+            if got != info_size {
+                continue;
+            }
+            // SAFETY: the call filled the whole struct, and an all-zero
+            // `proc_threadinfo` is valid anyway.
+            let info = unsafe { info.assume_init() };
+            // SAFETY: the kernel NUL-terminates `pth_name` within its
+            // fixed size; the zeroed buffer is NUL-terminated otherwise.
+            let name = unsafe { std::ffi::CStr::from_ptr(info.pth_name.as_ptr()) };
+            if name.to_bytes() == STANDBY_THREAD.as_bytes() {
+                return Some(info.pth_run_state == libc::TH_STATE_WAITING);
+            }
+        }
+        Some(false)
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    fn standby_parked() -> Option<bool> {
+        None
+    }
+
     /// Daemon pattern: build the coordinator, then `fork`. The standby hook
     /// worker started by `build()` does not exist in the child; the run
     /// there must still execute the hooks and end within the budget.
@@ -576,9 +678,10 @@ mod child {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }))
             .build();
-        // Let the standby worker block in its channel receive first: the
-        // worst case for the child, which must not touch that channel.
-        std::thread::sleep(Duration::from_millis(100));
+        // Fork only once the standby worker is blocked in its channel
+        // receive: the worst case for the child, which must not touch
+        // that channel.
+        wait_until_standby_parked();
         // SAFETY: `fork` has no memory-safety preconditions. The child
         // only runs the hook sequence and leaves with `_exit`, never
         // returning into the test harness.

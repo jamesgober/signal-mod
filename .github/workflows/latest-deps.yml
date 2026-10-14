@@ -32,8 +32,14 @@ jobs:
           components: clippy
       - name: Toolchain in use
         run: rustc -V && cargo -V
-      - name: cargo update
+      # `rust-version` (1.85) would otherwise make resolver 3 prefer
+      # MSRV-compatible versions; resolve the true latest, as a new
+      # dependent on current stable does. The MSRV job below keeps the
+      # MSRV-aware resolution.
+      - name: cargo update (true latest)
         run: cargo update --verbose
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: allow
       - name: Clippy, test (default, all features, no default features)
         shell: bash
         run: |
@@ -80,6 +86,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
-      - run: cargo update --verbose
+      - name: cargo update (true latest)
+        run: cargo update --verbose
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: allow
       - run: cargo audit
       - run: cargo deny check

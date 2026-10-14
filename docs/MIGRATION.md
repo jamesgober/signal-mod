@@ -115,7 +115,9 @@ with hooks parks one worker thread from `build()` until it runs its
 hooks or is dropped. A process that `fork`s after `build()` does not
 inherit it; the run in the child starts a fresh worker, so hooks still
 run within the budget. Programs that daemonize should still build the
-coordinator after forking.
+coordinator after forking. Fork safety covers only a coordinator that was
+built: do not install it, wait on its token, or run its hooks before
+forking.
 
 ### Back-end selection happens at `install()` time
 
