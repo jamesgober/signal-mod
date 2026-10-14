@@ -1,150 +1,230 @@
 # signal-mod - Migration Guide
 
-This guide covers the upgrade path **to** `signal-mod 1.0.0` and
-the policy that governs upgrades **within** the `1.x` line. For the
-authoritative API reference see [`API.md`](API.md); for the design
-contract see [`../REPS.md`](../REPS.md).
+This guide covers upgrading from `signal-mod 1.x` to `2.0`, and adopting
+the crate from `ctrlc`, `signal-hook` or `tokio::signal`. For the
+authoritative API see [`API.md`](API.md); for the design contract see
+[`../REPS.md`](../REPS.md).
 
 ## Table of contents
 
-- [Adopting `signal-mod 1.0.0`](#adopting-signal-mod-100)
-- [Upgrading within the `1.x` line](#upgrading-within-the-1x-line)
-- [Coexisting with `ctrlc` and `signal-hook`](#coexisting-with-ctrlc-and-signal-hook)
-- [Coexisting with daemon frameworks](#coexisting-with-daemon-frameworks)
-- [The `2.0` plan](#the-20-plan)
+- [1.x to 2.0 at a glance](#1x-to-20-at-a-glance)
+- [Breaking changes](#breaking-changes)
+- [Deprecations](#deprecations)
+- [New capabilities worth adopting](#new-capabilities-worth-adopting)
+- [Adopting signal-mod from other crates](#adopting-signal-mod-from-other-crates)
+- [Coexisting with other signal handlers](#coexisting-with-other-signal-handlers)
+- [Versioning policy](#versioning-policy)
 
-## Adopting `signal-mod 1.0.0`
-
-Add the dependency:
+## 1.x to 2.0 at a glance
 
 ```toml
 [dependencies]
-signal-mod = "1.0"
+signal-mod = "2"
 ```
 
-Default features (`std + tokio`) cover the most common path. To
-swap runtimes:
-
-```toml
-# async-std
-signal-mod = { version = "1.0", default-features = false, features = ["std", "async-std"] }
-
-# Synchronous Ctrl+C only, no async runtime
-signal-mod = { version = "1.0", default-features = false, features = ["std", "ctrlc-fallback"] }
-```
-
-Then follow the Quick Start in the [crate root rustdoc][docs-root]
-or [`examples/graceful_shutdown.rs`](../examples/graceful_shutdown.rs).
-
-[docs-root]: https://docs.rs/signal-mod/latest/signal_mod/
-
-### From a custom `ctrlc` + `signal-hook` setup
-
-Replace the custom dispatcher with a `Coordinator`. The typical
-mechanical changes:
-
-| Before                                                  | After                                                                |
-| ------------------------------------------------------- | -------------------------------------------------------------------- |
-| `ctrlc::set_handler(\|\| { /* set flag */ })`           | `let coord = Coordinator::builder().build(); coord.install()?;`      |
-| Polling a custom shutdown flag                          | `coord.token().wait().await` / `wait_blocking()`                     |
-| A `Vec<Box<dyn Fn()>>` cleanup list iterated by hand    | `coord.run_hooks(reason)` with `ShutdownHook` impls                  |
-| Hand-rolled priority sort                               | `ShutdownHook::priority` (descending; ties preserve insertion order) |
-| Catching panics around cleanup callbacks                | Built in: `run_hooks` is panic-safe per hook                         |
-
-### From `tokio::signal::ctrl_c().await`
-
-`tokio::signal::ctrl_c` only covers SIGINT / Ctrl+C. `signal-mod`'s
-default `SignalSet::graceful()` additionally covers SIGTERM and
-SIGHUP (and the Windows `CTRL_CLOSE_EVENT` / `CTRL_SHUTDOWN_EVENT`),
-which is what most services actually want.
-
-Replacement:
+Most 1.x code compiles unchanged. The typical service:
 
 ```rust,no_run
-use signal_mod::{Coordinator, ShutdownReason};
+use signal_mod::{Coordinator, ShutdownReason, SignalSet, hook_from_fn};
 
-# #[cfg(feature = "tokio")]
+#[tokio::main]
+async fn main() -> signal_mod::Result<()> {
+    let coord = Coordinator::builder()
+        .signals(SignalSet::graceful())
+        .hook(hook_from_fn("flush", 0, |_| {}))
+        .build();
+    coord.install()?;
+    let token = coord.token();
+    token.wait().await;
+    let reason = token.reason().unwrap_or(ShutdownReason::Requested);
+    // 1.x: `coord.run_hooks(reason)` - still compiles and works.
+    // 2.0: prefer the async form inside a runtime; it does not block it.
+    let report = coord.run_hooks_async(reason).await;
+    eprintln!("{report}");
+    Ok(())
+}
+```
+
+What changes for you depends on what you relied on. Read the next
+section.
+
+## Breaking changes
+
+### MSRV 1.85, edition 2024
+
+1.x supported Rust 1.75. 2.0 needs 1.85 (and is written in edition
+2024). Pin `signal-mod = "1"` if you cannot upgrade the toolchain.
+
+### Hooks run at most once
+
+1.x: every `run_hooks` call re-ran every hook (its rustdoc suggested
+calling it again with `Forced` as a second phase), while the
+`ShutdownHook::run` docs promised "at most once". 2.0 keeps the promise:
+the first call runs the hooks, every later call returns the report of
+that run.
+
+If you called `run_hooks` twice to get a forced second pass, use the
+built-in force phase instead:
+
+```rust
+use std::time::Duration;
+use signal_mod::Coordinator;
+
+let coord = Coordinator::builder()
+    .graceful_timeout(Duration::from_secs(5)) // hooks start with your reason until here
+    .force_timeout(Duration::from_secs(8))    // then with ShutdownReason::Forced until here
+    .build();
+# drop(coord);
+```
+
+### The graceful budget is enforced; `force_timeout` is used
+
+1.x only checked the budget between hooks, so one slow hook could run
+forever, and `force_timeout` was stored but never used. 2.0 runs hooks on
+a worker thread and abandons a hook still running at its deadline. Hooks
+that had not started when the graceful budget ran out now run in a force
+phase (bounded by `force_timeout`) instead of being skipped. With the
+defaults (5 s / 10 s), a run returns within about 10 seconds whatever the
+hooks do. To restore "no deadline", pass `Duration::MAX` to both.
+
+### Hooks run on a worker thread
+
+Hooks no longer run on the thread that calls `run_hooks`. `ShutdownHook`
+was always `Send + Sync + 'static`, but a hook that read thread-local
+state set by `main` must now capture that state instead. With the
+`tokio` feature the caller's Tokio runtime is entered on the worker
+thread, so `tokio::runtime::Handle::current()` keeps working.
+
+### A panicking hook is not counted as completed
+
+1.x counted a panicked hook in `run_hooks`'s return value and in
+`Statistics::hooks_completed`. 2.0 reports it as `Panicked`, with its
+message, and leaves it out of the completed count.
+
+### `Statistics` is `#[non_exhaustive]` and has new fields
+
+You can still read every field. Code that built a `Statistics` with a
+struct literal, or destructured it exhaustively, must use `..`. New
+fields: `hooks_panicked`, `hooks_timed_out`, `hooks_skipped`, `hooks`
+(per-hook status and timings), `installed`, `active_subsystems`.
+
+### Back-end selection happens at `install()` time
+
+1.x picked one back-end at compile time and let `tokio` silently win.
+2.0 uses Tokio when a Tokio runtime is current and the agnostic back-end
+otherwise (if enabled). `install()` outside a runtime with only `tokio`
+enabled now returns `Error::OutsideTokioRuntime` instead of panicking.
+
+### Feature changes
+
+| 1.x feature      | 2.0                                                                                 |
+| ---------------- | ----------------------------------------------------------------------------------- |
+| `tokio`          | unchanged (no longer enables Tokio's `macros` and `time` features)                  |
+| `async-std`      | deprecated alias of `agnostic`; no longer depends on async-std (discontinued)        |
+| `ctrlc-fallback` | alias of `agnostic`; now covers every signal in the set, not just Ctrl+C              |
+| (new) `agnostic` | runtime-agnostic back-end; also reachable as `smol`                                  |
+
+If you depended on `signal-mod`'s `tokio` feature to enable
+`tokio/macros` or `tokio/time` for your own code, enable them on your own
+`tokio` dependency.
+
+### Dropping the coordinator uninstalls its handlers
+
+1.x left listener tasks running and signals swallowed after the
+coordinator was dropped. 2.0 removes them and lets the OS default action
+apply again. Keep the coordinator alive for as long as you want the
+handlers (normally all of `main`); a function that builds a coordinator,
+installs it and returns only a token now loses the handlers on return.
+
+### `ShutdownToken::wait` returns a named future
+
+`wait()` is no longer an `async fn`; it returns `ShutdownFuture`, which
+is `'static` and works on every executor. `token.wait().await` is
+unchanged. It is also available without any runtime feature.
+
+### Signal numbers are per target
+
+`Signal::unix_number()` now returns the compiled target's number (1.x
+always returned Linux values: SIGUSR1 = 10 is SIGBUS on macOS). On
+non-Unix targets it returns `None` for `User1` / `User2`.
+
+### Windows mapping
+
+`Hangup` now also covers `CTRL_LOGOFF_EVENT`. The agnostic back-end
+(and the old `ctrlc-fallback` / `async-std` names) reports Ctrl+Break as
+`Quit` and console close as `Terminate` instead of reporting everything
+as `Interrupt`.
+
+### `SignalSet`'s `Debug` output
+
+It now lists the signals (`SignalSet {Terminate, Interrupt}`) instead of
+the raw bits.
+
+## Deprecations
+
+| Item                                  | Replacement                          | Removal |
+| ------------------------------------- | ------------------------------------ | ------- |
+| `Error::InvalidState`, `Error::Timeout` | none: never produced               | 3.0     |
+| feature `async-std`                   | feature `agnostic` (or `smol`)       | 3.0     |
+
+## New capabilities worth adopting
+
+- `run_hooks_async` from async code; `run_hooks_with_report` and
+  `RunReport` for logging what each hook did.
+- `ShutdownHook::timeout` / `FnHook::with_timeout` for per-hook bounds.
+- `CoordinatorBuilder::force_exit_on_second_signal(true)`.
+- `notify_signals` and `Coordinator::subscribe` for reload / log rotation.
+- `ShutdownReason::exit_code()` for `std::process::exit`.
+- `ShutdownToken::subsystem_guard` and `subsystems_finished` to wait for
+  workers; `ShutdownToken::child` for per-connection or per-job scopes.
+- `shutdown_signal()` for `with_graceful_shutdown`.
+- `Coordinator::simulate_signal` in tests.
+- The `tracing` feature for diagnostics.
+
+## Adopting signal-mod from other crates
+
+| Before                                              | After                                                                 |
+| --------------------------------------------------- | --------------------------------------------------------------------- |
+| `ctrlc::set_handler(\|\| flag.store(true))`         | `let coord = Coordinator::builder().build(); coord.install()?;`       |
+| polling a shutdown flag                             | `coord.token().wait().await` / `wait_blocking()`                      |
+| `signal_hook::iterator::Signals` for SIGHUP reload  | `notify_signals(..)` and `coord.subscribe()`                          |
+| a `Vec<Box<dyn Fn()>>` cleanup list                 | `ShutdownHook`s run by `run_hooks_async`, with deadlines               |
+| `tokio::signal::ctrl_c().await`                     | `signal_mod::shutdown_signal()?.await` (also SIGTERM and SIGHUP)      |
+| `CancellationToken` passed to tasks                 | `ShutdownToken` (or `cancellation_token()` with `tokio-util`)          |
+
+`tokio::signal::ctrl_c` covers only SIGINT / Ctrl+C. The default
+`SignalSet::graceful()` adds SIGTERM (what `kill`, systemd, Docker and
+Kubernetes send) and SIGHUP:
+
+```rust,no_run
 # #[tokio::main]
 # async fn main() -> signal_mod::Result<()> {
-let coord = Coordinator::builder().build();
-coord.install()?;
-
-let token = coord.token();
-token.wait().await;
-
-let _reason = token.reason().unwrap_or(ShutdownReason::Requested);
+let shutdown = signal_mod::shutdown_signal()?;
+let token = shutdown.token();
+shutdown.await;
+eprintln!("stopping: {:?}", token.reason());
 # Ok(())
 # }
 ```
 
-## Upgrading within the `1.x` line
+## Coexisting with other signal handlers
 
-The `1.x` line follows [Semantic Versioning]. `cargo update -p signal-mod`
-is sufficient for any patch (`1.x.y`) or minor (`1.x.0`) upgrade.
+- **Other code using `tokio::signal` or `signal-hook`:** registrations
+  compose; both see the signal while a coordinator is installed. On
+  Unix, once the last coordinator covering a signal is uninstalled the
+  OS default action takes over, so other listeners stop seeing that
+  signal. Keep the coordinator installed for the life of the process if
+  other code also listens.
+- **A framework that owns signals:** build the coordinator with
+  `SignalSet::empty()`, do not `install()` it, and forward with
+  `coord.simulate_signal(sig)` (or `trigger().trigger(..)`).
+- **The `ctrlc` crate:** on Windows it and the agnostic back-end both
+  register console handlers; prefer one of them.
 
-[Semantic Versioning]: https://semver.org/spec/v2.0.0.html
+## Versioning policy
 
-The contract is documented in [`../REPS.md`](../REPS.md) section 8;
-in summary:
-
-- **Patch (`1.x.y`)** - bug fixes, doc improvements, dep bumps in
-  semver-compatible ranges, CI changes. No public surface change.
-- **Minor (`1.x.0`)** - additions to the public surface, new opt-in
-  features, internal perf work. MSRV bumps allowed.
-- **Major (`2.0.0`)** - anything that removes, renames, or changes
-  the signature of a public symbol, retires a feature flag, or adds
-  a non-opt-in runtime dependency.
-
-The `Error` enum is `#[non_exhaustive]`. New variants may land in
-`1.x.0`; downstream `match` arms must include a wildcard.
-
-## Coexisting with `ctrlc` and `signal-hook`
-
-`signal-mod` sits at the layer above `ctrlc` and `signal-hook`. If
-your application already depends on one of them, you can:
-
-- **Keep an existing `ctrlc` handler** and wire its callback to
-  call `ShutdownTrigger::trigger`. Do not also call
-  `Coordinator::install` in this configuration; the two would
-  contend for the same OS slot.
-- **Keep an existing `signal-hook::iterator::Signals`** and forward
-  each signal to `ShutdownTrigger::trigger(ShutdownReason::Signal(...))`.
-  Same caveat: do not double-install.
-
-The cleanest path is to retire the direct dependency once you
-migrate fully to `signal-mod`. `signal-hook` is pulled in
-transitively through the `async-std` feature, so you do not save a
-dep by keeping your own copy.
-
-## Coexisting with daemon frameworks
-
-If you embed `signal-mod` inside a larger daemon framework, pick
-exactly one signal-handler owner:
-
-- **Framework owns signals** - configure the framework as usual.
-  Build the `signal-mod` `Coordinator` with `SignalSet::empty()`
-  and forward signals from the framework's own handler by calling
-  `ShutdownTrigger::trigger(ShutdownReason::Signal(...))`.
-- **`signal-mod` owns signals** - configure the framework to skip
-  its own signal install (most frameworks expose a flag for this),
-  then call `coord.install()` on the `signal-mod` coordinator.
-
-Process-global signal slots are first-come-first-served. Two
-handlers in the same process do not compose.
-
-## The `2.0` plan
-
-There is no `2.0` plan as of the `1.0.0` tag. Breaking-change ideas
-that surface in the wild will be collected and considered for a
-future `2.0`. Until then, `1.x` is the stable line.
-
-Items that are explicitly out of scope for the `1.x` line and
-deferred to a hypothetical `2.0`:
-
-- An `async fn` `ShutdownHook::run` (would force a runtime choice
-  into the trait).
-- Per-thread signal masks (the current contract is process-global).
-- `no_std` core (the implementation needs `Mutex`, `Condvar`,
-  `Instant`, and the signal back-ends).
-
-If you have a concrete need for any of these, file an issue.
+`signal-mod` follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
+patch releases fix bugs, minor releases add API or opt-in features,
+and anything that breaks code or behavior, including an MSRV raise, is a
+major release with an entry in this guide. Deprecated items survive at
+least one major version.

@@ -135,3 +135,16 @@ pub use crate::token::{
 
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Compile and run every Rust block in the user-facing Markdown docs.
+#[cfg(all(doctest, not(loom)))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+#[cfg(all(doctest, not(loom)))]
+#[doc = include_str!("../docs/API.md")]
+struct ApiGuideDoctests;
+
+#[cfg(all(doctest, not(loom)))]
+#[doc = include_str!("../docs/MIGRATION.md")]
+struct MigrationGuideDoctests;

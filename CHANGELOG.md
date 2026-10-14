@@ -6,6 +6,164 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+Major release driven by the 2026-10-13 audit (findings SM-001 to
+SM-023). Upgrade notes: `docs/MIGRATION.md`.
+
+### Added
+
+- Enforced hook deadlines. Hooks run on a worker thread; a hook still
+  running at its own timeout or at the end of its phase is reported
+  `TimedOut` and abandoned, and the run continues. A run returns within
+  `force_timeout` whatever the hooks do (SM-002).
+- Force phase: hooks not started when `graceful_timeout` runs out start
+  with `ShutdownReason::Forced` until `force_timeout` (total budget,
+  measured from the start of the run) runs out; the rest are `Skipped`.
+  `force_timeout` was previously stored but unused (SM-002, D1, D2).
+- `ShutdownHook::timeout` (default `None`) and `FnHook::with_timeout`.
+- `Coordinator::run_hooks_with_report` returning `RunReport`, with
+  `HookOutcome`, `HookStatus`, `HookPhase`: per-hook status, phase,
+  duration and panic message (SM-017).
+- `Coordinator::run_hooks_async` / `RunHooksFuture`: runs the hooks on a
+  supervisor thread without blocking the executor, on any runtime. With
+  the `tokio` feature hooks run with the caller's runtime entered, so
+  `Handle::current().block_on(..)` works inside a hook (SM-003).
+- `CoordinatorBuilder::force_exit_on_second_signal`: a second shutdown
+  signal exits the process with the signal's conventional status
+  (SM-002).
+- Non-shutdown signals: `CoordinatorBuilder::notify_signals`,
+  `Coordinator::subscribe`, `SignalSubscription` (`recv`, `try_recv`,
+  `recv_blocking`, `recv_timeout`, `is_closed`) and `Recv` (SM-013).
+- `Coordinator::uninstall`, `is_installed` after uninstall,
+  `backend()` / `Backend`, `installed_signals()`, and default-action
+  restoration when the last coordinator covering a signal is
+  uninstalled or dropped (SM-011).
+- `Coordinator::simulate_signal` for tests and signal forwarding.
+- Runtime-agnostic waiting: `ShutdownToken::wait` returns
+  `ShutdownFuture` (no polling, any executor, `'static`), plus
+  `ShutdownToken::cancelled`, `IntoFuture` for `ShutdownToken` and
+  `&ShutdownToken` (SM-008).
+- Child scopes: `ShutdownToken::child`.
+- Subsystem tracking: `ShutdownToken::subsystem_guard`, `SubsystemGuard`,
+  `active_subsystems`, `subsystems_finished` / `SubsystemsFinished`,
+  `wait_subsystems_blocking`.
+- `ShutdownTrigger::token`.
+- Feature `agnostic` (alias `smol`): runtime-agnostic back-end, a
+  signal-hook listener thread on Unix and a console control handler on
+  Windows that tells all five console events apart.
+- Feature `tracing`: events for deliveries, installs, hooks and
+  escalation.
+- Feature `tokio-util`: `ShutdownToken::cancellation_token` and
+  `From<&ShutdownToken> for CancellationToken`.
+- `shutdown_signal()` / `ShutdownSignal` for `with_graceful_shutdown`.
+- `Signal::from_unix_number`, `Signal::exit_code`,
+  `ShutdownReason::exit_code`, `ShutdownReason::signal`.
+- `SignalSet`: `union`, `intersection`, `difference`,
+  `available_on_current_platform`, operators `|` `&` `-` (and assign
+  forms), `From<Signal>`, `FromIterator`, `Extend`, `Hash`,
+  `IntoIterator for &SignalSet` (SM-017, D7). `SignalSetIter` is
+  `ExactSizeIterator` and `FusedIterator`.
+- `Statistics` fields `hooks_panicked`, `hooks_timed_out`,
+  `hooks_skipped`, `hooks` (live per-hook status and timings),
+  `installed`, `active_subsystems`; `PartialEq`/`Eq` (SM-017).
+- `Hash` for `ShutdownReason`.
+- `Error::OutsideTokioRuntime` and `Error::ListenerThread`.
+- Examples `reload_on_sighup`, `axum_server`, `smol_runtime`.
+- Tests: real-signal end-to-end tests in child processes on Unix and
+  Windows, hook deadline / run-once / re-entrancy tests, installation
+  tests per back-end, runtime-agnostic waiting tests, loom models of the
+  state machine, more property and stress tests (SM-010, SM-020).
+- `deny.toml`, `rust-toolchain.toml`, CI feature matrix, cross-target
+  lint, MSRV, loom, AddressSanitizer, audit, deny and semver jobs
+  (SM-010, SM-018, SM-022).
+
+### Changed
+
+- MSRV raised from 1.75 to 1.85; edition 2024.
+- Hooks run at most once per coordinator. Every `run_hooks*` call after
+  (or during) the first returns that run's report (SM-007, D4).
+- Hooks run on a worker thread instead of the caller's thread.
+- A panicking hook is reported `Panicked` and no longer counted as
+  completed (SM-003).
+- Hooks are sorted once at `build()` (stable) instead of on every run
+  (D15).
+- No lock is held while hooks run: `statistics()` and `Debug` work from
+  inside a hook and never wait for a running hook (SM-005).
+- `install()` picks the back-end at call time (Tokio inside a Tokio
+  runtime, otherwise the agnostic back-end) and is all-or-nothing:
+  every stream is registered before any listener starts (SM-014).
+- Dropping a `Coordinator` uninstalls its listeners.
+- `Signal::Hangup` also covers `CTRL_LOGOFF_EVENT` on Windows (SM-015).
+- `ctrlc-fallback` and `async-std` are aliases of `agnostic`: they now
+  cover every signal in the set and report Windows events accurately
+  (SM-015).
+- `ShutdownToken::is_initiated` uses `Acquire` ordering (SM-019).
+- The `tokio` dependency enables only `rt` and `signal` (was also
+  `macros`, `time`, `sync`) (SM-016).
+- `SignalSet`'s `Debug` output lists the signals.
+- `Statistics` is `#[non_exhaustive]`.
+- The crate root lint set follows REPS (`deny(warnings)`,
+  `unused_results`, `clippy::unwrap_used`, ... and `clippy::pedantic`);
+  `forbid(unsafe_code)` became `deny(unsafe_code)` with one documented
+  exception (the Windows console handler registration) (SM-018).
+- `parking_lot` replaced by `std::sync` (SM-023): no mandatory
+  dependency on Windows, only `libc` constants on Unix.
+- Criterion 0.5 to 0.8; benches use `std::hint::black_box`.
+- Package contents restricted with `include` (no CI files, release
+  notes or lint configs).
+
+### Deprecated
+
+- Feature `async-std` (async-std is discontinued, RUSTSEC-2025-0052):
+  use `agnostic` or `smol`. Removal no earlier than 3.0.
+- `Error::InvalidState`, `Error::Timeout`: never produced. Removal no
+  earlier than 3.0.
+
+### Removed
+
+- Dependencies `parking_lot`, `async-std`, `futures`, `ctrlc`,
+  `signal-hook-async-std` (and through them `async-io` 1, `rustix` 0.37,
+  `instant`).
+
+### Fixed
+
+- `Signal::unix_number` returned Linux numbers on every target, so on
+  macOS and the BSDs `User1` / `User2` registered SIGBUS / SIGSYS under
+  the async-std back-end, and on MIPS Linux the wrong signals. Numbers
+  now come from `libc` (SM-001, D8, D9).
+- `reason()` could return `None` after `is_initiated()` returned `true`:
+  the reason is now published before the flag (SM-004, D6).
+- `install()` outside a Tokio runtime panicked and left the coordinator
+  marked as installed; it now returns `Error::OutsideTokioRuntime` (or
+  uses the agnostic back-end) and leaves no state behind. A Tokio
+  runtime without an I/O driver gives `Error::SignalRegistration`
+  instead of a panic (SM-006, D22).
+- The async-std `wait()` slept 1-50 ms between polls (median wake
+  latency 27 ms); waiting is now notification-driven everywhere
+  (SM-008).
+- A partially failed install left earlier listeners running; a failure
+  under async-std named the wrong signal (SM-014).
+- After a coordinator was dropped, SIGINT / SIGTERM / Ctrl+C were
+  silently swallowed for the rest of the process (SM-011).
+- The `ctrlc-fallback` and async-std back-ends reported Ctrl+Break as
+  `Interrupt` and ignored SIGTERM / SIGHUP and console close (SM-015).
+- Documentation that did not match the code: the "timeout ladder",
+  "hooks have at most this long", "at most once", "consistent
+  snapshot", `&SignalSet: IntoIterator`, the `Handle::block_on` bridge,
+  "do not install from two coordinators", Windows event coverage,
+  "early scaffolding", examples coverage, `.dev/DESIGN.md` references
+  (D1 to D29; D18 and D26 corrected in REPS.md and below).
+- Vacuous tests (`ran <= 2`, an empty install test) replaced with real
+  assertions (SM-020).
+
+### Security
+
+- Removed the discontinued async-std (RUSTSEC-2025-0052) and the
+  unmaintained `instant` (RUSTSEC-2024-0384) from every feature's
+  dependency graph; `deny.toml` bans async-std.
+- A hung hook or main loop can no longer make the process ignore further
+  termination signals: deadlines are enforced and second-signal
+  escalation is available (SM-002).
+
 ## [1.0.0] - 2026-05-19
 
 ### Added
@@ -74,7 +232,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   `Signal` and `ShutdownReason` at 256 cases per property; 10
   algebraic properties total.
 
-## [1.0.0-rc.1] - 2026-05-19
+## 1.0.0-rc.1 - 2026-05-19
 
 ### Changed
 
@@ -117,7 +275,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Crate version bumped from `0.9.0` to `0.9.1`. No source under
   `src/` changed; this is a CI-only patch.
 
-## [0.9.0] - 2026-05-19
+## 0.9.0 - 2026-05-19
 
 ### Added
 
@@ -139,7 +297,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Crate version bumped from `0.4.0` to `0.9.0` to mark the
   pre-1.0 stabilization milestone.
 
-## [0.4.0] - 2026-05-19
+## 0.4.0 - 2026-05-19
 
 ### Added
 
@@ -157,7 +315,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 - Crate version bumped from `0.3.0` to `0.4.0`.
 
-## [0.3.0] - 2026-05-19
+## 0.3.0 - 2026-05-19
 
 ### Added
 
@@ -190,7 +348,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - `forbid(unsafe_code)` retained; all platform `unsafe` is delegated
   to `tokio`, `signal-hook`, and `ctrlc`.
 
-## [0.2.0] - 2026-05-19
+## 0.2.0 - 2026-05-19
 
 ### Added
 
@@ -213,7 +371,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Crate version bumped to `0.2.0` to mark design-lock milestone. No
   source under `src/` changed; implementation lands in `0.3.0`.
 
-## [0.1.0] - 2026-05-12
+## 0.1.0 - 2026-05-12
 
 ### Added
 
@@ -223,11 +381,7 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 - Crate name reserved on crates.io.
 
 [Unreleased]: https://github.com/jamesgober/signal-mod/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/jamesgober/signal-mod/releases/tag/v1.0.0
-[1.0.0-rc.1]: https://github.com/jamesgober/signal-mod/releases/tag/v1.0.0-rc.1
+[1.0.0]: https://github.com/jamesgober/signal-mod/compare/v0.9.1...v1.0.0
 [0.9.1]: https://github.com/jamesgober/signal-mod/releases/tag/v0.9.1
-[0.9.0]: https://github.com/jamesgober/signal-mod/releases/tag/v0.9.0
-[0.4.0]: https://github.com/jamesgober/signal-mod/releases/tag/v0.4.0
-[0.3.0]: https://github.com/jamesgober/signal-mod/releases/tag/v0.3.0
-[0.2.0]: https://github.com/jamesgober/signal-mod/releases/tag/v0.2.0
-[0.1.0]: https://github.com/jamesgober/signal-mod/releases/tag/v0.1.0
+
+<!-- Versions without a link were never tagged on GitHub. -->

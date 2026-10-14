@@ -9,373 +9,334 @@
 - **Author:** James Gober <me@jamesgober.com>
 - **Repository:** https://github.com/jamesgober/signal-mod
 - **License:** Apache-2.0
-- **MSRV:** 1.75
+- **MSRV:** 1.85 (edition 2024)
 
 ## 2. Mission
 
-Unified OS signal handling for Rust. SIGTERM / SIGINT / SIGHUP / SIGPIPE
-and Windows equivalents through one API. Graceful shutdown
-orchestration with priority ordering, timeout enforcement, and hook
-chaining. Replaces the patchwork of `ctrlc` + `signal-hook` with a
-clean runtime-agnostic substrate.
+Unified OS signal handling for Rust. SIGTERM / SIGINT / SIGHUP /
+SIGQUIT / SIGPIPE / SIGUSR1 / SIGUSR2 and the Windows console control
+events through one API. Graceful-shutdown orchestration with priority
+ordering, an enforced graceful-then-force deadline, run-once hooks and a
+report of what each hook did. A small, runtime-agnostic substrate that
+heavier frameworks (such as `proc-daemon`) can build on.
 
 ## 3. Scope
 
 `signal-mod` provides:
 
-1. A cross-platform `Signal` enum that abstracts away the differences
-   between Unix signals and Windows console control events.
-2. A `Coordinator` that owns a shutdown state machine, fans signals
-   out to observers, and runs priority-ordered shutdown hooks under a
-   configurable timeout ladder.
+1. A cross-platform `Signal` enum with per-target signal numbers, and a
+   const bit-set `SignalSet`.
+2. A `Coordinator` that installs signal listeners (Tokio or
+   runtime-agnostic back-end), owns the shutdown state, fans signals out
+   to observers and subscribers, and runs priority-ordered shutdown hooks
+   under an enforced deadline ladder.
 3. Cloneable `ShutdownToken` (observer) and `ShutdownTrigger`
-   (initiator) handles that downstream code can hold without owning
-   the coordinator.
-4. Optional runtime adapters for `tokio` and `async-std` that expose
-   async wait points (`token.wait().await`) backed by the runtime's
-   own signal stream, broadcast, or polling primitives.
+   (initiator) handles, with runtime-agnostic waiting, child scopes and
+   subsystem guards.
+4. Subscriptions for signals that do not mean "stop" (reload, log
+   rotation).
 
-Out of scope items are enumerated in section 12.
+Out of scope items are listed in section 12.
 
 ## 4. Public API
 
-The public surface of `signal-mod 1.x.y` is the following set of
-items, all re-exported from the crate root unless otherwise noted.
-Every item below is frozen by the `1.0.0` semver contract; see
-section 8 for the stability commitment.
+The public surface of `signal-mod 2.x.y`. Every item is re-exported from
+the crate root and covered by semantic versioning (section 8).
 
-### 4.1 Signal taxonomy
+### 4.1 Signals
 
-```rust
-/// Cross-platform unified signal identifier.
-///
-/// Variants map to their nearest platform equivalent. On Unix the
-/// mapping is direct (SIGTERM, SIGINT, etc.). On Windows the mapping
-/// is to Windows console control events: `Terminate` -> CTRL_CLOSE,
-/// `Interrupt` -> CTRL_C, `Quit` -> CTRL_BREAK, `Hangup` ->
-/// CTRL_SHUTDOWN. Unix-only variants (`Pipe`, `User1`, `User2`) are
-/// inert on Windows.
+```rust,ignore
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Signal {
-    Terminate,
-    Interrupt,
-    Quit,
-    Hangup,
-    Pipe,
-    User1,
-    User2,
-}
+pub enum Signal { Terminate, Interrupt, Quit, Hangup, Pipe, User1, User2 }
 
 impl Signal {
+    pub const ALL: [Signal; 7];
     pub const fn description(self) -> &'static str;
-    pub const fn unix_number(self) -> Option<i32>;
+    pub const fn unix_number(self) -> Option<i32>;       // per compiled target
+    pub const fn from_unix_number(n: i32) -> Option<Signal>;
+    pub const fn exit_code(self) -> i32;                 // 128 + number
     pub const fn is_unix_only(self) -> bool;
-    pub fn available_on_current_platform(self) -> bool;
+    pub const fn available_on_current_platform(self) -> bool;
 }
-```
 
-### 4.2 Signal sets
-
-```rust
-/// Bit-packed set of signals the coordinator will install handlers
-/// for. Const-constructible so default sets are zero-cost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignalSet { /* private bits */ }
+#[derive(Clone, Copy, PartialEq, Eq, Hash)] // Debug lists the signals
+pub struct SignalSet { /* u16 */ }
 
 impl SignalSet {
     pub const fn empty() -> Self;
     pub const fn all() -> Self;
-    /// `Terminate | Interrupt | Hangup`. Recommended default for
-    /// long-running services.
-    pub const fn graceful() -> Self;
-    /// `Terminate | Interrupt | Quit | Hangup`. Maximum graceful
-    /// coverage.
-    pub const fn standard() -> Self;
-
+    pub const fn graceful() -> Self;   // Terminate | Interrupt | Hangup (also Default)
+    pub const fn standard() -> Self;   // graceful | Quit
     pub const fn with(self, sig: Signal) -> Self;
     pub const fn without(self, sig: Signal) -> Self;
+    pub const fn union(self, other: Self) -> Self;
+    pub const fn intersection(self, other: Self) -> Self;
+    pub const fn difference(self, other: Self) -> Self;
     pub const fn contains(self, sig: Signal) -> bool;
     pub const fn is_empty(self) -> bool;
     pub const fn len(self) -> usize;
-    pub fn iter(&self) -> SignalSetIter;
+    pub const fn available_on_current_platform(self) -> Self;
+    pub const fn iter(&self) -> SignalSetIter;
 }
+// BitOr / BitAnd / Sub (+ *Assign) with SignalSet or Signal, From<Signal>,
+// FromIterator<Signal>, Extend<Signal>, IntoIterator (by value and by ref).
 
-pub struct SignalSetIter { /* ... */ }
-impl Iterator for SignalSetIter { type Item = Signal; /* ... */ }
+pub struct SignalSetIter; // ExactSizeIterator + FusedIterator, canonical order
 ```
 
-### 4.3 Shutdown reason
+### 4.2 Shutdown reason
 
-```rust
-/// Reason a shutdown was initiated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShutdownReason {
-    Signal(Signal),
-    Requested,
-    Forced,
-    Timeout,
-    Error,
-}
+```rust,ignore
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShutdownReason { Signal(Signal), Requested, Forced, Timeout, Error }
 
 impl ShutdownReason {
     pub const fn description(self) -> &'static str;
     pub const fn is_signal(self) -> bool;
+    pub const fn signal(self) -> Option<Signal>;
+    pub const fn exit_code(self) -> i32;
 }
-
-impl core::fmt::Display for ShutdownReason { /* ... */ }
 ```
 
-### 4.4 Observer and initiator handles
+### 4.3 Handles
 
-```rust
-/// Cheap-to-clone observer handle. Hand one of these to every
-/// subsystem that needs to react to shutdown.
+```rust,ignore
 #[derive(Debug, Clone)]
-pub struct ShutdownToken { /* Arc<Inner> */ }
+pub struct ShutdownToken;
 
 impl ShutdownToken {
     pub fn is_initiated(&self) -> bool;
     pub fn reason(&self) -> Option<ShutdownReason>;
     pub fn elapsed(&self) -> Option<Duration>;
-
-    /// Block the current thread until shutdown is initiated.
+    pub fn wait(&self) -> ShutdownFuture;
+    pub fn cancelled(&self) -> ShutdownFuture;
     pub fn wait_blocking(&self);
-
-    /// Block the current thread for at most `timeout`. Returns true
-    /// if shutdown was observed.
     pub fn wait_blocking_timeout(&self, timeout: Duration) -> bool;
-
-    /// Async wait. Tokio variant; gated on the `tokio` feature.
-    #[cfg(feature = "tokio")]
-    pub async fn wait(&self);
-
-    /// Async wait. async-std variant; gated on the `async-std`
-    /// feature and only compiled when `tokio` is not enabled.
-    #[cfg(all(feature = "async-std", not(feature = "tokio")))]
-    pub async fn wait(&self);
+    pub fn child(&self) -> (ShutdownTrigger, ShutdownToken);
+    pub fn subsystem_guard(&self) -> SubsystemGuard;
+    pub fn active_subsystems(&self) -> usize;
+    pub fn subsystems_finished(&self) -> SubsystemsFinished;
+    pub fn wait_subsystems_blocking(&self, timeout: Duration) -> bool;
+    #[cfg(feature = "tokio-util")]
+    pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken;
 }
+// IntoFuture for ShutdownToken and &ShutdownToken;
+// From<&ShutdownToken> for CancellationToken (feature `tokio-util`).
 
-/// Cheap-to-clone initiator handle. Hand one of these to any code
-/// path that may need to ask for shutdown (HTTP `/shutdown` route,
-/// supervisory parent, fatal-error site).
+pub struct ShutdownFuture;      // Future<Output = ()> + Send + 'static
+pub struct SubsystemGuard;      // decrements on drop
+pub struct SubsystemsFinished;  // Future<Output = ()> + Send + 'static
+
 #[derive(Debug, Clone)]
-pub struct ShutdownTrigger { /* Arc<Inner> */ }
+pub struct ShutdownTrigger;
 
 impl ShutdownTrigger {
-    /// Initiate shutdown with the given reason. Returns true if this
-    /// call performed the transition; false if it was already
-    /// initiated.
     pub fn trigger(&self, reason: ShutdownReason) -> bool;
     pub fn is_initiated(&self) -> bool;
+    pub fn token(&self) -> ShutdownToken;
 }
 ```
 
-### 4.5 Shutdown hooks
+### 4.4 Hooks and reports
 
-```rust
-/// A unit of cleanup work to run during shutdown.
+```rust,ignore
 pub trait ShutdownHook: Send + Sync + 'static {
     fn name(&self) -> &str;
-
-    /// Higher priority hooks run first. Defaults to 0.
     fn priority(&self) -> i32 { 0 }
-
-    /// Cleanup body. Called once, on the coordinator's draining
-    /// thread (sync). Hooks needing async work should bridge via
-    /// the runtime's `block_on` or schedule onto a runtime they
-    /// hold separately.
-    fn run(&self, reason: ShutdownReason);
+    fn timeout(&self) -> Option<Duration> { None }
+    fn run(&self, reason: ShutdownReason);   // called at most once
 }
 
-/// Convenience: convert any closure into a hook.
-pub fn hook_from_fn<F>(name: impl Into<String>, priority: i32, f: F) -> impl ShutdownHook
-where
-    F: Fn(ShutdownReason) + Send + Sync + 'static;
+pub struct FnHook<F>;                         // with_timeout(self, Duration) -> Self
+pub fn hook_from_fn<F>(name: impl Into<String>, priority: i32, f: F) -> FnHook<F>;
+
+#[non_exhaustive] pub struct RunReport;       // reason, outcomes, elapsed, counts, is_clean
+#[non_exhaustive] pub struct HookOutcome {    // public fields
+    pub name: Arc<str>, pub priority: i32, pub status: HookStatus,
+    pub phase: Option<HookPhase>, pub duration: Option<Duration>,
+    pub panic_message: Option<String>,
+}
+#[non_exhaustive] pub enum HookStatus { Pending, Running, Completed, Panicked, TimedOut, Skipped }
+#[non_exhaustive] pub enum HookPhase { Graceful, Force }
+pub struct RunHooksFuture;                    // Future<Output = RunReport> + Send + 'static
 ```
 
-### 4.6 Coordinator
+### 4.5 Coordinator
 
-```rust
-pub struct Coordinator { /* ... */ }
+```rust,ignore
+pub struct Coordinator;
 
 impl Coordinator {
     pub fn builder() -> CoordinatorBuilder;
-
     pub fn token(&self) -> ShutdownToken;
     pub fn trigger(&self) -> ShutdownTrigger;
-
-    /// Install OS-level signal handlers for the configured set.
-    /// Idempotent within a single coordinator; the same physical
-    /// process must not have two coordinators install handlers for
-    /// the same signal concurrently.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::AlreadyInstalled` if this coordinator has
-    /// already installed its handlers, and
-    /// `Error::SignalRegistration` if the platform rejects the
-    /// registration.
     pub fn install(&self) -> Result<()>;
-
-    /// Run all registered hooks in priority order. Honors the
-    /// graceful timeout. Returns the number of hooks that completed
-    /// in time.
+    pub fn uninstall(&self) -> bool;                  // also on Drop
+    pub fn is_installed(&self) -> bool;
+    pub fn backend(&self) -> Option<Backend>;
+    pub fn installed_signals(&self) -> SignalSet;
+    pub fn subscribe(&self) -> SignalSubscription;
+    pub fn simulate_signal(&self, sig: Signal) -> bool;
     pub fn run_hooks(&self, reason: ShutdownReason) -> usize;
-
+    pub fn run_hooks_with_report(&self, reason: ShutdownReason) -> RunReport;
+    pub fn run_hooks_async(&self, reason: ShutdownReason) -> RunHooksFuture;
     pub fn statistics(&self) -> Statistics;
+    pub fn signals(&self) -> SignalSet;
+    pub fn notify_signals(&self) -> SignalSet;
+    pub fn graceful_timeout(&self) -> Duration;
+    pub fn force_timeout(&self) -> Duration;
+    pub fn force_exit_on_second_signal(&self) -> bool;
 }
 
-pub struct CoordinatorBuilder { /* ... */ }
+pub struct CoordinatorBuilder;   // signals, notify_signals, graceful_timeout,
+                                 // force_timeout, force_exit_on_second_signal,
+                                 // hook, build; Default
 
-impl CoordinatorBuilder {
-    pub fn signals(self, set: SignalSet) -> Self;
-    pub fn graceful_timeout(self, d: Duration) -> Self;
-    pub fn force_timeout(self, d: Duration) -> Self;
-    pub fn hook<H: ShutdownHook>(self, h: H) -> Self;
-    pub fn build(self) -> Coordinator;
-}
-
-#[derive(Debug, Clone)]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statistics {
-    pub initiated: bool,
-    pub reason: Option<ShutdownReason>,
-    pub hooks_registered: usize,
-    pub hooks_completed: usize,
-    pub elapsed: Option<Duration>,
+    pub initiated: bool, pub reason: Option<ShutdownReason>, pub elapsed: Option<Duration>,
+    pub hooks_registered: usize, pub hooks_completed: usize, pub hooks_panicked: usize,
+    pub hooks_timed_out: usize, pub hooks_skipped: usize, pub hooks: Vec<HookOutcome>,
+    pub installed: bool, pub active_subsystems: usize,
 }
+
+#[non_exhaustive] pub enum Backend { Tokio, Agnostic }
+
+pub struct SignalSubscription;  // recv() -> Recv, try_recv, recv_blocking, recv_timeout, is_closed
+pub struct Recv<'a>;            // Future<Output = Option<Signal>>
+
+pub fn shutdown_signal() -> Result<ShutdownSignal>;
+pub struct ShutdownSignal;      // Future<Output = ()>; reason(), token()
 ```
 
-### 4.7 Error type
+### 4.6 Errors and constants
 
-```rust
+```rust,ignore
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Error {
     AlreadyInstalled,
     SignalRegistration { signal: Signal, source: std::io::Error },
-    InvalidState(&'static str),
-    Timeout(&'static str),
+    #[deprecated(since = "2.0.0")] InvalidState(&'static str),
+    #[deprecated(since = "2.0.0")] Timeout(&'static str),
     NoRuntime,
+    OutsideTokioRuntime,
+    ListenerThread(std::io::Error),
 }
-
-impl core::fmt::Display for Error { /* ... */ }
-impl std::error::Error for Error { /* ... */ }
-
 pub type Result<T> = core::result::Result<T, Error>;
-```
-
-### 4.8 Crate-level constants and helpers
-
-```rust
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str;
 ```
 
 ## 5. Safety contract
 
-The core implementation is `#![deny(unsafe_code)]`. Signal
-installation is delegated to runtime crates (`tokio`,
-`signal-hook-async-std`) which carry their own audited `unsafe`. The
-runtime-less fallback uses `ctrlc 3.x`, which similarly contains the
-`unsafe` blocks behind a vetted boundary. `signal-mod` itself
-contains no `unsafe` blocks.
-
-If any `unsafe` is added in a future release, every block must carry
-a `// SAFETY:` comment per `.dev/DIRECTIVES.md` section 3.
+The crate is `#![deny(unsafe_code)]`. Signal installation is delegated to
+audited crates: `tokio::signal`, and `signal-hook` for the Unix agnostic
+back-end and default restoration. The one exception is a single FFI call
+in the Windows agnostic back-end, `SetConsoleCtrlHandler` (through
+`windows-sys`), in a module that opts out locally and carries a
+`// SAFETY:` justification. The handler it registers never unwinds
+across the FFI boundary (panics are caught).
 
 ## 6. MSRV policy
 
-Pinned at 1.75. Bumps require a minor version increment and a
-CHANGELOG entry under `### Changed` with rationale.
+1.85, declared in `Cargo.toml` and checked in CI for the library with
+every back-end. Raising it is a breaking change and requires a major
+version. The repository's `rust-toolchain.toml` pins the development
+toolchain separately (dev-dependencies such as criterion need newer).
 
 ## 7. Performance contract
 
-The fast path of `ShutdownToken::is_initiated` is a single relaxed
-atomic load. `ShutdownTrigger::trigger` is one compare-exchange plus
-notification of waiters. Hook iteration is `O(n log n)` once at sort
-time and `O(n)` thereafter. Concrete numbers ship in `0.4.0` once
-benchmarks land.
+- `ShutdownToken::is_initiated` is one `Acquire` load; `reason` and
+  `elapsed` are lock-free loads; a redundant `trigger` is one load.
+- The first `trigger` takes one uncontended lock, publishes with
+  `Release`, and wakes waiters after releasing it.
+- `wait()` never polls on a timer: the trigger wakes the task.
+- Hooks are sorted once at `build()`. A hook run spawns one worker
+  thread (plus a fresh one per timed-out hook) and does not context
+  switch per hook while hooks finish in time.
+- Every number in the README is produced by `benches/shutdown_bench.rs`.
 
 ## 8. Stability guarantees
 
-`signal-mod 1.0.0` is production-stable. Every public item
-re-exported from the crate root is covered by semantic versioning:
+Every public item re-exported from the crate root is covered by
+semantic versioning:
 
-- **Patch (`1.x.y`)** - bug fixes, dep bumps inside
-  semver-compatible ranges, doc improvements, CI fixes. No public
-  surface change.
-- **Minor (`1.x.0`)** - pure additions to the public surface,
-  new opt-in features, internal performance work that does not
-  change behavior. MSRV bumps allowed; see section 6.
-- **Major (`2.0.0`)** - anything that removes, renames, or
-  changes the signature of a public symbol, retires a feature
-  flag, or adds a non-opt-in runtime dependency.
+- **Patch (`2.x.y`):** bug fixes, documentation, dependency bumps inside
+  compatible ranges, CI changes. No public surface or behavior change
+  beyond the fix.
+- **Minor (`2.x.0`):** additions to the public surface, new opt-in
+  features, deprecations, internal performance work.
+- **Major (`3.0.0`):** removal or signature change of a public item,
+  retiring a feature flag, behavior changes, MSRV raises. Items
+  deprecated in 2.x (`Error::InvalidState`, `Error::Timeout`, the
+  `async-std` feature) are removed no earlier than 3.0.
 
-The `Error` enum is `#[non_exhaustive]`, so adding variants is a
-minor-version change. Downstream `match` arms must include a
-wildcard.
+`Signal`, `ShutdownReason`, `Error`, `HookStatus`, `HookPhase`,
+`Backend`, `Statistics`, `RunReport` and `HookOutcome` are
+`#[non_exhaustive]`.
 
 ## 9. Dependency policy
 
-Zero runtime dependencies preferred. The current dependency set is:
+Zero mandatory dependencies on Windows; `libc` (constants only) on Unix.
+Everything else is optional and feature-gated:
 
-- `parking_lot` (runtime, default) - non-poisoning mutex for the
-  internal state machine. Justified in `.dev/DESIGN.md`.
-- `tokio` (optional, feature `tokio`) - async wait point and signal
-  stream.
-- `async-std`, `signal-hook-async-std`, `signal-hook`, `futures`
-  (optional, feature `async-std`) - same role under async-std.
-- `ctrlc` (optional, feature `ctrlc-fallback`) - no-runtime signal
-  installation path.
-- `libc` (optional, target_family = "unix", feature `async-std`) -
-  pulled in transitively by the async-std signal path.
+| Dependency    | Feature(s)              | Role                                                     |
+| ------------- | ----------------------- | -------------------------------------------------------- |
+| `libc`        | always, Unix only       | per-target signal numbers                                |
+| `tokio`       | `tokio`                 | listener tasks, runtime context for hooks (`rt`, `signal`) |
+| `signal-hook` | `tokio`, `agnostic` (Unix) | listener iterator; conditional default restoration    |
+| `windows-sys` | `agnostic` (Windows)    | `SetConsoleCtrlHandler`                                  |
+| `tracing`     | `tracing`               | diagnostics                                              |
+| `tokio-util`  | `tokio-util`            | `CancellationToken` interop                              |
 
-Any future addition requires a documented justification entry in
-`.dev/DESIGN.md`.
+`cargo audit` and `cargo deny check` (policy in `deny.toml`) run in CI.
+The discontinued `async-std` crate is banned from the graph.
 
 ## 10. Testing requirements
 
-- Every public method has a `#[cfg(test)]` exercise once the API
-  stabilizes at `0.3.0`.
-- Integration tests in `tests/` cover the cross-platform scenarios
-  (signal trigger, hook ordering, timeout behavior, double-install
-  rejection).
-- Property tests in `tests/` (via `proptest`) ship at `0.9.0`.
-- Doc tests for every public entry point ship at `0.9.0`.
+- Unit tests in every module; integration tests in `tests/` for the
+  public surface, hooks and deadlines, installation, edge cases.
+- Property tests (`proptest`) for `SignalSet` algebra, signal numbers,
+  trigger idempotence, hook ordering and run-once.
+- Real-thread stress tests for every concurrency claim; loom models of
+  the state machine (`RUSTFLAGS="--cfg loom"`).
+- End-to-end real-signal tests in child processes on Linux, macOS and
+  Windows (`tests/real_signals.rs`).
+- Every code block in `README.md`, `docs/API.md` and `docs/MIGRATION.md`
+  is compiled by `cargo test --doc`.
+- CI covers the default, all-features and no-default-features builds and
+  every feature on its own, on Linux (x86_64, ARM64), macOS and Windows.
 
 ## 11. Documentation requirements
 
-Every public item carries a rustdoc block. `# Errors`, `# Panics`,
-and `# Examples` sections are present where applicable. `docs/API.md`
-mirrors the rustdoc layout for offline readers.
+Every public item carries rustdoc with `# Errors`, `# Panics` (none of
+the public API panics) and `# Examples` where applicable.
+`#![deny(missing_docs)]` enforces coverage. `docs/API.md` is the
+cross-cutting guide; `docs/MIGRATION.md` covers every breaking change.
 
 ## 12. Out of scope
 
-The following are explicitly out of scope and will not be added in
-the `1.0` line:
-
-- Process supervision (spawning child processes, managing their
-  lifecycle). That is the job of `proc-daemon`, which is a downstream
-  consumer of this crate.
-- Service-manager integration (`sd_notify`, Windows Service Control
+- Process supervision (spawning and managing child processes). That is
+  `proc-daemon`'s job; it can build on this crate.
+- Service-manager integration (`sd_notify`, the Windows Service Control
   Manager). Belongs in a separate adapter crate.
-- Logging or tracing facade. The crate emits zero log output by
-  default; observability is the caller's responsibility.
-- Per-thread signal masks. The current contract is process-global.
+- Per-thread signal masks. The contract is process-global.
+- Async hook bodies (`async fn run`). Hooks are synchronous and can
+  bridge to async cleanup through `run_hooks_async`; an async trait
+  would force a runtime choice into the trait.
 
-## 13. Real-world consumers
+## 13. Intended consumers
 
-The design is validated against three concrete consumer profiles:
-
-1. **`proc-daemon`** (in-tree sibling crate) - async daemon
-   framework. Wants a runtime-agnostic substrate for signal handling
-   so its own surface (Subsystem, ShutdownCoordinator) does not have
-   to choose between `ctrlc` and `signal-hook`.
-2. **CLI long-running tools** (e.g. local development servers, log
-   tailers, file watchers) - want a one-liner that installs sane
-   defaults, runs a single async closure on shutdown, and otherwise
-   stays out of the way.
-3. **Embedded supervisor processes** (e.g. workers spawned by a
-   parent that uses `proc-daemon`) - want the trigger half without
-   the install half, because the parent already owns signal
-   delivery. The `ShutdownTrigger` / `ShutdownToken` split makes this
-   trivial.
+1. **`proc-daemon`** - async daemon framework that wants a
+   runtime-agnostic substrate for signals and shutdown instead of using
+   `ctrlc`, `signal-hook` and `signal-hook-async-std` directly. (As of
+   this release it does not depend on `signal-mod` yet.)
+2. **Long-running services and CLI tools** - want sane defaults, a
+   bounded shutdown, and a one-line integration with their HTTP server.
+3. **Embedded worker processes** - want the trigger half without the
+   install half when a parent owns signal delivery; the
+   `ShutdownTrigger` / `ShutdownToken` split and `simulate_signal`
+   cover this.
