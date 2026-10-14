@@ -10,6 +10,7 @@
     <a href="https://docs.rs/signal-mod"><img alt="docs.rs" src="https://docs.rs/signal-mod/badge.svg"></a>
     <a href="https://github.com/jamesgober/signal-mod/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/jamesgober/signal-mod/actions/workflows/ci.yml/badge.svg"></a>
     <a href="https://github.com/rust-lang/rfcs/blob/master/text/2495-min-rust-version.md" title="MSRV"><img alt="MSRV" src="https://img.shields.io/badge/MSRV-1.85%2B-blue"></a>
+    <a href="#license"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg"></a>
 </p>
 
 <p align="center">
@@ -53,11 +54,16 @@ the standard library provides:
   deadline, per-hook timeouts, panic capture with message, a
   `RunReport`, live per-hook progress in `Statistics`, and
   `run_hooks_async` that never blocks the executor.
-- **Escalation:** opt-in "second Ctrl+C exits now" with the conventional
-  status (130 / 143), and `ShutdownReason::exit_code()` for the normal
-  path.
-- **Clean teardown:** dropping the coordinator removes its listeners and
-  gives the signals back to the OS default action.
+- **Escalation:** opt-in "second Ctrl+C ends the process now" (the
+  signal is re-raised on Unix, so shells see a real SIGINT death; exit
+  status 130 / 143 on Windows), and `ShutdownReason::exit_code()` for the
+  normal path.
+- **Clean teardown:** dropping the coordinator removes its listeners.
+  On Unix, shutdown signals that were at their default action before
+  signal-mod get it back; signals that other code ignored or handled are
+  left to that code.
+- **Hook cooperation:** `HookContext::current()` tells a running hook its
+  deadline and whether it has been abandoned.
 
 
 <hr>
@@ -255,37 +261,41 @@ from 1.x: [`docs/MIGRATION.md`](docs/MIGRATION.md).
 ## Performance
 
 Measured with `cargo bench --bench shutdown_bench` (criterion) on an
-AMD Ryzen 9 9950X3D, Windows 11, Rust 1.95.0, release profile, both
-versions back to back on 2026-10-13. The machine was shared with other
-builds (about 50-60 % CPU load), so treat the numbers as upper bounds
+AMD Ryzen 9 9950X3D, Windows 11, Rust 1.99.0, release profile, both
+versions back to back on 2026-10-14. The machine was shared with other
+builds (roughly 25-60 % CPU load), so treat the numbers as upper bounds
 and rerun the bench on your hardware. 1.0.0 was measured with its own
-bench file (criterion 0.5); its `SignalSet::iter` row was re-measured
-with the input hidden behind `black_box`, as 2.0.0's bench does.
+bench file (criterion 0.5). The `SignalSet::iter` row compares both
+crates inside one criterion 0.8 harness with the input behind
+`black_box`; the two bench files' harness overheads differ by a few
+nanoseconds.
 
-| Operation                                        | 2.0.0    | 1.0.0    |
-| ------------------------------------------------ | -------- | -------- |
-| `ShutdownToken::is_initiated` (not initiated)    | 334 ps   | 391 ps   |
-| `ShutdownToken::reason` (initiated, lock-free)   | 483 ps   | n/a      |
-| `ShutdownTrigger::trigger` (first, transition)   | 73 ns    | 146 ns   |
-| `ShutdownTrigger::trigger` (already initiated)   | 1.5 ns   | 5.5 ns   |
-| `ShutdownToken::clone`                           | 8.7 ns   | 8.5 ns   |
-| poll a ready `wait()` future                     | 10.3 ns  | n/a      |
-| `Coordinator::statistics` (16 hooks)             | 379 ns   | n/a      |
-| subscription deliver + `try_recv`                | 74 ns    | n/a      |
-| `SignalSet::iter` (all 7)                        | 2.6 ns   | 2.6 ns   |
-| `Coordinator::run_hooks` (1 hook)                | 74 us    | 72 ns    |
-| `Coordinator::run_hooks` (4 hooks)               | 71 us    | 188 ns   |
-| `Coordinator::run_hooks` (16 hooks)              | 77 us    | 648 ns   |
-| `Coordinator::run_hooks` (64 hooks)              | 78 us    | 2.44 us  |
-| `wait_blocking_timeout(1 us)` (not initiated)    | 15.6 ms  | 15.5 ms  |
+| Operation                                        | 2.0.0         | 1.0.0    |
+| ------------------------------------------------ | ------------- | -------- |
+| `ShutdownToken::is_initiated` (not initiated)    | 390 ps        | 534 ps   |
+| `ShutdownToken::reason` (initiated, lock-free)   | 690 ps        | n/a      |
+| `ShutdownTrigger::trigger` (first, transition)   | 73 ns         | 165 ns   |
+| `ShutdownTrigger::trigger` (already initiated)   | 2.0 ns        | 6.0 ns   |
+| `ShutdownToken::clone`                           | 9.5 ns        | 8.9 ns   |
+| poll a ready `wait()` future                     | 11 ns         | n/a      |
+| `Coordinator::statistics` (16 hooks)             | 425 ns        | n/a      |
+| subscription deliver + `try_recv`                | 86 ns         | n/a      |
+| `SignalSet::iter` (all 7, same harness)          | 3.3-3.7 ns    | 2.9-3.7 ns |
+| `Coordinator::run_hooks` (1 hook)                | 25 us         | 74 ns    |
+| `Coordinator::run_hooks` (4 hooks)               | 29 us         | 198 ns   |
+| `Coordinator::run_hooks` (64 hooks)              | 43 us         | 2.6 us   |
+| `wait_blocking_timeout(1 us)` (not initiated)    | 15.6 ms       | 15.2 ms  |
 
 - The observer paths got faster: the reason is published in atomics, so
   `reason()` and a redundant `trigger()` are plain loads.
-- `run_hooks` is slower by design. It starts a worker thread so that it
-  can enforce deadlines on arbitrary hook code (1.0.0 ran hooks inline
-  and could not stop a hung one). The cost is one thread spawn, about
-  70 us here, paid once per process; additional hooks that finish in time
-  add no context switch each (64 hooks cost about the same as 1).
+- `run_hooks` is slower by design, and this is the one tracked metric
+  that regressed. Enforcing a deadline on arbitrary hook code needs the
+  hooks to run on another thread (1.0.0 ran them inline and could not
+  stop a hung one). A coordinator with hooks therefore parks a standby
+  worker thread when it is built; a run costs one hand-off to it and one
+  wake-up of the caller: tens of microseconds, once per coordinator run,
+  with large scheduler variance on Windows. Hooks that finish in time
+  add no context switch each, so 64 hooks cost about the same as one.
 - `wait_blocking_timeout` with a sub-millisecond budget measures the
   Windows timer granularity (about 15.6 ms), not the primitive.
 
@@ -337,7 +347,15 @@ Style is enforced with `cargo fmt`; correctness with
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).
+Licensed under either of
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
+- MIT license ([`LICENSE-MIT`](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in the work by you, as defined in
+the Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.
 
 
 <br>

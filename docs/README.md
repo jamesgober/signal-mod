@@ -16,6 +16,7 @@ The rustdoc for the published crate is on
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
+Licensed under either the Apache License, Version 2.0, or the MIT
+license, at your option.
 
 Copyright (C) 2026 James Gober.

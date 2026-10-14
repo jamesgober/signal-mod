@@ -19,7 +19,7 @@ For the design contract see [`REPS.md`](../REPS.md); for upgrading from
 - [`ShutdownToken`](#shutdowntoken), [`ShutdownFuture`](#shutdownfuture),
   [`SubsystemGuard`](#subsystemguard), [`SubsystemsFinished`](#subsystemsfinished)
 - [`ShutdownTrigger`](#shutdowntrigger)
-- [`ShutdownHook`](#shutdownhook), [`FnHook`](#fnhook), [`hook_from_fn`](#hook_from_fn)
+- [`ShutdownHook`](#shutdownhook), [`HookContext`](#hookcontext), [`FnHook`](#fnhook), [`hook_from_fn`](#hook_from_fn)
 - [`Coordinator`](#coordinator)
 - [`CoordinatorBuilder`](#coordinatorbuilder)
 - [Running hooks: the deadline ladder](#running-hooks-the-deadline-ladder)
@@ -362,7 +362,10 @@ Contract:
   `run_hooks_async` from async code so the runtime stays free to drive
   it.
 - `timeout()` bounds this hook; past it (or past the phase deadline) the
-  hook is reported `TimedOut` and abandoned while the run continues.
+  hook is reported `TimedOut` and abandoned while the run continues. An
+  abandoned hook keeps running on its thread until it returns, holding
+  whatever locks it took: keep critical sections in hooks short, or
+  check [`HookContext`](#hookcontext) between steps.
 - A panic is caught and reported with its message.
 
 ```rust
@@ -381,6 +384,34 @@ impl ShutdownHook for FlushCache {
 }
 
 let coord = Coordinator::builder().hook(FlushCache).build();
+assert_eq!(coord.run_hooks(ShutdownReason::Requested), 1);
+```
+
+## `HookContext`
+
+`HookContext::current()` returns the context of the hook running on the
+calling thread (`None` outside a hook): `deadline()`, `remaining()` and
+`is_abandoned()`. Hooks cannot be stopped from outside; this is how a
+long hook cooperates with the deadline.
+
+```rust
+use std::time::Duration;
+use signal_mod::{Coordinator, HookContext, ShutdownReason, hook_from_fn};
+
+let coord = Coordinator::builder()
+    .hook(
+        hook_from_fn("flush-batches", 0, |_| {
+            let ctx = HookContext::current().expect("inside a hook");
+            for _batch in 0..3 {
+                if ctx.is_abandoned() {
+                    return;
+                }
+                // flush one batch ...
+            }
+        })
+        .with_timeout(Duration::from_secs(5)),
+    )
+    .build();
 assert_eq!(coord.run_hooks(ShutdownReason::Requested), 1);
 ```
 
@@ -429,12 +460,28 @@ assert_eq!(hook.timeout(), Some(Duration::from_secs(1)));
 3. Otherwise `Error::OutsideTokioRuntime` (only `tokio` enabled) or
    `Error::NoRuntime` (no back-end).
 
-Installation is all-or-nothing and never panics. Several coordinators
-can be installed at once; each receives its signals. On uninstall or
-drop, a signal no other coordinator handles gets its OS default action
-back (terminate; SIGPIPE stays ignored). On Unix, if your program also
-listens to one of those signals through `tokio::signal` directly, that
-listener stops seeing it once the last covering coordinator is gone.
+Installation is all-or-nothing. Several coordinators can be installed
+at once, through either back-end, and every one receives its signals
+(on Windows both back-ends share one console control handler for that
+reason).
+
+After the last coordinator covering a signal is uninstalled or dropped:
+
+| Situation (Unix) | What happens the next time the signal arrives |
+| ---------------- | --------------------------------------------- |
+| shutdown signal that was at its default action when signal-mod first installed it | the default action: the process terminates (SIGQUIT dumps core). This also applies if other code registered its own handler for that signal after signal-mod did. |
+| signal that was ignored or already handled before signal-mod (SIGHUP under `nohup`, another library's handler) | left to that earlier owner |
+| notify-only signal, or SIGPIPE | absorbed (ignored), as with `tokio::signal` |
+
+On Windows the console handler declines events nobody covers, and the
+next handler (ultimately the OS default, terminate) runs.
+
+`install` never panics with unwinding panics. One caveat: with the Tokio
+back-end on Unix and a runtime built without its I/O driver, Tokio panics
+inside `install`; signal-mod catches the unwind and returns
+`Error::SignalRegistration`, but the panic hook still runs, and a
+`panic = "abort"` binary aborts. `#[tokio::main]` and `Runtime::new`
+enable the driver.
 
 The coordinator is the installation guard: keep it alive (normally for
 all of `main`).
@@ -482,7 +529,7 @@ fn main() -> signal_mod::Result<()> {
 | `notify_signals(set)`               | empty                   | signals delivered to subscribers only                 |
 | `graceful_timeout(d)`               | 5 s                     | graceful phase budget, from the start of the hook run |
 | `force_timeout(d)`                  | 10 s                    | total budget for the run, including the force phase   |
-| `force_exit_on_second_signal(bool)` | `false`                 | second shutdown signal exits with its `exit_code()`   |
+| `force_exit_on_second_signal(bool)` | `false`                 | a second shutdown signal ends the process (re-raised on Unix, `exit_code()` on Windows) |
 | `hook(h)`                           | none                    | register a hook                                       |
 | `build()`                           |                         | sort hooks once, create the coordinator               |
 
@@ -509,10 +556,14 @@ Hooks are sorted once at `build()` by descending priority (stable: ties
 keep registration order). A run then goes through:
 
 1. **Graceful phase.** Starts hooks with the caller's reason until
-   `graceful_timeout` has elapsed since the run began.
+   `graceful_timeout` has elapsed since the first hook started.
 2. **Force phase.** Starts the remaining hooks with
    `ShutdownReason::Forced` until `force_timeout` has elapsed since the
-   run began. `force_timeout <= graceful_timeout` disables it.
+   first hook started. `force_timeout <= graceful_timeout` disables it.
+
+The clock starts when the worker is about to start the first hook, so
+the first hook always starts in the graceful phase (unless that budget
+is zero), however long the worker thread took to be scheduled.
 3. **Skipped.** Hooks not started when the force budget is gone.
 
 Each hook runs on a worker thread; the run waits for it until the
@@ -536,14 +587,14 @@ use std::time::Duration;
 use signal_mod::{Coordinator, HookPhase, HookStatus, ShutdownReason, hook_from_fn};
 
 let coord = Coordinator::builder()
-    .graceful_timeout(Duration::from_millis(50))
-    .force_timeout(Duration::from_secs(1))
-    .hook(hook_from_fn("hangs", 10, |_| std::thread::sleep(Duration::from_secs(3))))
+    .graceful_timeout(Duration::from_millis(200))
+    .force_timeout(Duration::from_secs(20))
+    .hook(hook_from_fn("hangs", 10, |_| std::thread::sleep(Duration::from_secs(30))))
     .hook(hook_from_fn("flush", 0, |reason| assert_eq!(reason, ShutdownReason::Forced)))
     .build();
 
 let report = coord.run_hooks_with_report(ShutdownReason::Requested);
-assert!(report.elapsed() < Duration::from_secs(3));
+assert!(report.elapsed() < Duration::from_secs(20));
 assert_eq!(report.outcomes()[0].status, HookStatus::TimedOut);
 assert_eq!(report.outcomes()[1].status, HookStatus::Completed);
 assert_eq!(report.outcomes()[1].phase, Some(HookPhase::Force));
@@ -741,7 +792,7 @@ the OS error) and `Display`.
 | `SignalRegistration { signal, source }` | the OS rejected `signal`, or the Tokio runtime has no I/O driver (`enable_all`) |
 | `NoRuntime`                             | no back-end feature enabled; enable `tokio` or `agnostic`                    |
 | `OutsideTokioRuntime`                   | only `tokio` enabled and called outside a runtime; call inside it or enable `agnostic` |
-| `ListenerThread(io::Error)`             | the agnostic listener could not start; retry                                 |
+| `ListenerThread(io::Error)`             | the listener could not start (Unix thread or self-pipe, Windows console handler registration); retry |
 | `InvalidState`, `Timeout`               | deprecated since 2.0.0, never produced, removed in 3.0                       |
 
 ```rust
@@ -771,11 +822,18 @@ assert_eq!(signal_mod::VERSION, env!("CARGO_PKG_VERSION"));
 
 **Unix.** Numbers come from `libc` for the compiled target. The Tokio
 back-end uses `tokio::signal::unix`; the agnostic back-end a signal-hook
-iterator thread. Neither library ever removes an OS handler, so
-signal-mod arms a conditional default action that takes over once the
-last coordinator covering a signal is gone.
+iterator thread. Neither library ever removes an OS handler, so for
+shutdown signals that were at their default action before signal-mod
+installed them, signal-mod arms a conditional default action that takes
+over once the last coordinator covering the signal is gone (see
+[`install`](#install)). A second-signal escalation re-raises the signal
+with its default action, so the parent sees a death by that signal.
 
-**Windows.** `Interrupt` is Ctrl+C, `Quit` Ctrl+Break, `Terminate` the
+**Windows.** Both back-ends use one shared console control handler.
+Windows calls console handlers last-registered first and stops at the
+first that claims the event, so a handler registered by other code after
+signal-mod's sees events first (and can hide them from it).
+`Interrupt` is Ctrl+C, `Quit` Ctrl+Break, `Terminate` the
 console window closing, `Hangup` logoff or system shutdown (delivered to
 services only). After `CTRL_CLOSE_EVENT` the OS terminates the process
 about 5 seconds later; both back-ends hold the OS handler thread so that
@@ -792,11 +850,12 @@ of `installed_signals()`.
 `cargo bench --bench shutdown_bench`; numbers and conditions are in the
 [README](../README.md#performance). The observer hot paths
 (`is_initiated`, `reason`, polling a ready `wait()` future) are
-lock-free loads. A hook run costs one worker thread spawn (about 70 us
-on the reference machine), paid once per process: the price of
-enforcing deadlines on arbitrary code. Hooks that finish in time add no
-context switch each.
+lock-free loads. A coordinator with hooks parks one standby worker
+thread when it is built, so a hook run does not pay for a thread spawn:
+it costs one hand-off to that thread and one wake-up of the caller, once
+per coordinator run. Hooks that finish in time add no context switch
+each.
 
 ---
 
-Copyright (C) 2026 James Gober. Licensed under Apache-2.0.
+Copyright (C) 2026 James Gober. Licensed under Apache-2.0 OR MIT.

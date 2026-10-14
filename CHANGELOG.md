@@ -6,8 +6,9 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
-Major release driven by the 2026-10-13 audit (findings SM-001 to
-SM-023). Upgrade notes: `docs/MIGRATION.md`.
+Major release driven by the 2026-10-13 audit of 1.0.0 (findings SM-001
+to SM-023) and the re-audit of the 2.0.0 candidate (SM2-001 to
+SM2-015). Upgrade notes: `docs/MIGRATION.md`.
 
 ### Added
 
@@ -16,9 +17,14 @@ SM-023). Upgrade notes: `docs/MIGRATION.md`.
   `TimedOut` and abandoned, and the run continues. A run returns within
   `force_timeout` whatever the hooks do (SM-002).
 - Force phase: hooks not started when `graceful_timeout` runs out start
-  with `ShutdownReason::Forced` until `force_timeout` (total budget,
-  measured from the start of the run) runs out; the rest are `Skipped`.
+  with `ShutdownReason::Forced` until `force_timeout` (total budget)
+  runs out; the rest are `Skipped`. Both budgets are measured from the
+  moment the first hook starts, so worker start-up never eats into them
+  and the first hook always starts in the graceful phase (SM2-002).
   `force_timeout` was previously stored but unused (SM-002, D1, D2).
+- `HookContext::current()` inside a hook: `deadline()`, `remaining()`,
+  `is_abandoned()`, so long hooks can cooperate with the deadline
+  (SM2-009).
 - `ShutdownHook::timeout` (default `None`) and `FnHook::with_timeout`.
 - `Coordinator::run_hooks_with_report` returning `RunReport`, with
   `HookOutcome`, `HookStatus`, `HookPhase`: per-hook status, phase,
@@ -28,15 +34,19 @@ SM-023). Upgrade notes: `docs/MIGRATION.md`.
   the `tokio` feature hooks run with the caller's runtime entered, so
   `Handle::current().block_on(..)` works inside a hook (SM-003).
 - `CoordinatorBuilder::force_exit_on_second_signal`: a second shutdown
-  signal exits the process with the signal's conventional status
-  (SM-002).
+  signal ends the process. On Unix the signal is re-raised with its
+  default action, so the parent sees a death by that signal; on Windows
+  the process exits with 128 + number (SM-002, SM2-013).
 - Non-shutdown signals: `CoordinatorBuilder::notify_signals`,
   `Coordinator::subscribe`, `SignalSubscription` (`recv`, `try_recv`,
   `recv_blocking`, `recv_timeout`, `is_closed`) and `Recv` (SM-013).
 - `Coordinator::uninstall`, `is_installed` after uninstall,
-  `backend()` / `Backend`, `installed_signals()`, and default-action
-  restoration when the last coordinator covering a signal is
-  uninstalled or dropped (SM-011).
+  `backend()` / `Backend`, `installed_signals()`. On Unix, when the last
+  coordinator covering a shutdown signal is uninstalled or dropped, the
+  signal's default action comes back, but only if it was the default
+  before signal-mod first installed it: a signal ignored or handled by
+  other code is left to that code, and notify-only signals are never
+  restored (SM-011, SM2-004).
 - `Coordinator::simulate_signal` for tests and signal forwarding.
 - Runtime-agnostic waiting: `ShutdownToken::wait` returns
   `ShutdownFuture` (no polling, any executor, `'static`), plus
@@ -49,7 +59,9 @@ SM-023). Upgrade notes: `docs/MIGRATION.md`.
 - `ShutdownTrigger::token`.
 - Feature `agnostic` (alias `smol`): runtime-agnostic back-end, a
   signal-hook listener thread on Unix and a console control handler on
-  Windows that tells all five console events apart.
+  Windows that tells all five console events apart. The Tokio back-end
+  uses the same handler on Windows, so coordinators installed through
+  either back-end all receive every event (SM2-005).
 - Feature `tracing`: events for deliveries, installs, hooks and
   escalation.
 - Feature `tokio-util`: `ShutdownToken::cancellation_token` and
@@ -88,6 +100,9 @@ SM-023). Upgrade notes: `docs/MIGRATION.md`.
   (D15).
 - No lock is held while hooks run: `statistics()` and `Debug` work from
   inside a hook and never wait for a running hook (SM-005).
+- A coordinator with hooks parks one standby worker thread at build
+  time, so `run_hooks` hands off to it instead of spawning a thread
+  (SM2-010).
 - `install()` picks the back-end at call time (Tokio inside a Tokio
   runtime, otherwise the agnostic back-end) and is all-or-nothing:
   every stream is registered before any listener starts (SM-014).
@@ -102,14 +117,22 @@ SM-023). Upgrade notes: `docs/MIGRATION.md`.
 - `SignalSet`'s `Debug` output lists the signals.
 - `Statistics` is `#[non_exhaustive]`.
 - The crate root lint set follows REPS (`deny(warnings)`,
-  `unused_results`, `clippy::unwrap_used`, ... and `clippy::pedantic`);
-  `forbid(unsafe_code)` became `deny(unsafe_code)` with one documented
-  exception (the Windows console handler registration) (SM-018).
+  `unused_results`, `clippy::unwrap_used`, ... and `clippy::pedantic`).
+  `deny(warnings)` is lifted only for docs.rs builds, so a lint added to
+  a future nightly cannot leave a release without documentation
+  (SM2-012). `forbid(unsafe_code)` became `deny(unsafe_code)` with two
+  documented exceptions: the Windows console handler registration and a
+  read-only `sigaction` query on Unix (SM-018, SM2-004).
+- License: `Apache-2.0 OR MIT` (was `Apache-2.0`); the Apache text moved
+  to `LICENSE-APACHE` and `LICENSE-MIT` was added.
 - `parking_lot` replaced by `std::sync` (SM-023): no mandatory
   dependency on Windows, only `libc` constants on Unix.
 - Criterion 0.5 to 0.8; benches use `std::hint::black_box`.
 - Package contents restricted with `include` (no CI files, release
   notes or lint configs).
+- CI runs on pull requests and on pushes to `main`, `feature/**` and
+  `fix/**`, with the lint toolchain pinned (1.99.0, bumped deliberately
+  together with `rust-toolchain.toml`) (SM2-001, SM2-011).
 
 ### Deprecated
 
@@ -136,7 +159,9 @@ SM-023). Upgrade notes: `docs/MIGRATION.md`.
   marked as installed; it now returns `Error::OutsideTokioRuntime` (or
   uses the agnostic back-end) and leaves no state behind. A Tokio
   runtime without an I/O driver gives `Error::SignalRegistration`
-  instead of a panic (SM-006, D22).
+  instead of a panic escaping `install` (Tokio still panics internally:
+  the panic hook runs, and `panic = "abort"` binaries abort; documented
+  under `# Panics`) (SM-006, D22, SM2-007).
 - The async-std `wait()` slept 1-50 ms between polls (median wake
   latency 27 ms); waiting is now notification-driven everywhere
   (SM-008).

@@ -131,8 +131,11 @@ If you depended on `signal-mod`'s `tokio` feature to enable
 ### Dropping the coordinator uninstalls its handlers
 
 1.x left listener tasks running and signals swallowed after the
-coordinator was dropped. 2.0 removes them and lets the OS default action
-apply again. Keep the coordinator alive for as long as you want the
+coordinator was dropped. 2.0 removes them. On Unix, shutdown signals
+that were at their default action before signal-mod installed them get
+it back (the next one terminates the process); signals that other code
+ignored or handled first are left alone, and notify-only signals stay
+absorbed. Keep the coordinator alive for as long as you want the
 handlers (normally all of `main`); a function that builds a coordinator,
 installs it and returns only a token now loses the handlers on return.
 
@@ -209,17 +212,28 @@ eprintln!("stopping: {:?}", token.reason());
 
 ## Coexisting with other signal handlers
 
-- **Other code using `tokio::signal` or `signal-hook`:** registrations
-  compose; both see the signal while a coordinator is installed. On
-  Unix, once the last coordinator covering a signal is uninstalled the
-  OS default action takes over, so other listeners stop seeing that
-  signal. Keep the coordinator installed for the life of the process if
-  other code also listens.
-- **A framework that owns signals:** build the coordinator with
-  `SignalSet::empty()`, do not `install()` it, and forward with
-  `coord.simulate_signal(sig)` (or `trigger().trigger(..)`).
-- **The `ctrlc` crate:** on Windows it and the agnostic back-end both
-  register console handlers; prefer one of them.
+- **Other code using `tokio::signal` or `signal-hook` on Unix:**
+  registrations compose; both see the signal while a coordinator is
+  installed. If the other code registered its handler **before**
+  signal-mod first installed that signal, signal-mod leaves the signal to
+  it after the last coordinator is gone. If it registered **after**, and
+  the signal is in a coordinator's shutdown set, the restored default
+  action terminates the process on the next delivery once the last
+  coordinator is gone: keep the coordinator installed for the life of
+  the process in that case.
+- **A framework that owns signals:** configure the coordinator with the
+  sets you want (`signals(..)`, `notify_signals(..)`), do not call
+  `install()`, and forward each signal the framework receives with
+  `coord.simulate_signal(sig)`; it returns `false` for a signal in
+  neither set. Alternatively call
+  `coord.trigger().trigger(ShutdownReason::Signal(sig))`, which needs no
+  configuration.
+- **Other Windows console handlers (the `ctrlc` crate, another
+  library):** Windows calls the most recently registered handler first
+  and stops at the first that claims the event. Both signal-mod
+  back-ends share one handler, so signal-mod coordinators never hide
+  events from each other, but a handler registered by other code later
+  can hide them from signal-mod. Prefer one owner.
 
 ## Versioning policy
 

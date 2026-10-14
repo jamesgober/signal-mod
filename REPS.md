@@ -8,7 +8,7 @@
 - **Crate name:** `signal-mod`
 - **Author:** James Gober <me@jamesgober.com>
 - **Repository:** https://github.com/jamesgober/signal-mod
-- **License:** Apache-2.0
+- **License:** Apache-2.0 OR MIT
 - **MSRV:** 1.85 (edition 2024)
 
 ## 2. Mission
@@ -150,6 +150,7 @@ pub trait ShutdownHook: Send + Sync + 'static {
 }
 
 pub struct FnHook<F>;                         // with_timeout(self, Duration) -> Self
+pub struct HookContext;                       // current(), deadline(), remaining(), is_abandoned()
 pub fn hook_from_fn<F>(name: impl Into<String>, priority: i32, f: F) -> FnHook<F>;
 
 #[non_exhaustive] pub struct RunReport;       // reason, outcomes, elapsed, counts, is_clean
@@ -233,12 +234,16 @@ pub const VERSION: &str;
 ## 5. Safety contract
 
 The crate is `#![deny(unsafe_code)]`. Signal installation is delegated to
-audited crates: `tokio::signal`, and `signal-hook` for the Unix agnostic
-back-end and default restoration. The one exception is a single FFI call
-in the Windows agnostic back-end, `SetConsoleCtrlHandler` (through
-`windows-sys`), in a module that opts out locally and carries a
-`// SAFETY:` justification. The handler it registers never unwinds
-across the FFI boundary (panics are caught).
+audited crates: `tokio::signal` (Unix), and `signal-hook` for the Unix
+agnostic back-end and default restoration. Two modules opt out locally,
+each with a `// SAFETY:` justification on every block:
+
+- `install/console.rs` (Windows): one `SetConsoleCtrlHandler` call
+  (through `windows-sys`). The handler it registers never unwinds across
+  the FFI boundary (panics are caught).
+- `install/disposition.rs` (Unix): one read-only `sigaction` call (null
+  new action) that reads a signal's disposition before signal-mod first
+  installs it, so that only a default disposition is ever restored.
 
 ## 6. MSRV policy
 
@@ -288,7 +293,7 @@ Everything else is optional and feature-gated:
 | `libc`        | always, Unix only       | per-target signal numbers                                |
 | `tokio`       | `tokio`                 | listener tasks, runtime context for hooks (`rt`, `signal`) |
 | `signal-hook` | `tokio`, `agnostic` (Unix) | listener iterator; conditional default restoration    |
-| `windows-sys` | `agnostic` (Windows)    | `SetConsoleCtrlHandler`                                  |
+| `windows-sys` | `tokio`, `agnostic` (Windows) | `SetConsoleCtrlHandler` (shared console handler)   |
 | `tracing`     | `tracing`               | diagnostics                                              |
 | `tokio-util`  | `tokio-util`            | `CancellationToken` interop                              |
 
@@ -312,8 +317,12 @@ The discontinued `async-std` crate is banned from the graph.
 
 ## 11. Documentation requirements
 
-Every public item carries rustdoc with `# Errors`, `# Panics` (none of
-the public API panics) and `# Examples` where applicable.
+Every public item carries rustdoc with `# Errors`, `# Panics` and
+`# Examples` where applicable. No public function panics with an
+unwinding panic; the one documented caveat is `Coordinator::install` on
+a Tokio runtime without its I/O driver (Tokio panics internally; the
+unwind is caught and turned into an error, but `panic = "abort"`
+binaries abort).
 `#![deny(missing_docs)]` enforces coverage. `docs/API.md` is the
 cross-cutting guide; `docs/MIGRATION.md` covers every breaking change.
 
@@ -337,6 +346,6 @@ cross-cutting guide; `docs/MIGRATION.md` covers every breaking change.
 2. **Long-running services and CLI tools** - want sane defaults, a
    bounded shutdown, and a one-line integration with their HTTP server.
 3. **Embedded worker processes** - want the trigger half without the
-   install half when a parent owns signal delivery; the
-   `ShutdownTrigger` / `ShutdownToken` split and `simulate_signal`
-   cover this.
+   install half when a parent owns signal delivery: configure the
+   coordinator's sets, skip `install()`, and forward with
+   `simulate_signal` (or `trigger().trigger(ShutdownReason::Signal(..))`).
