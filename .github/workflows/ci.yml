@@ -8,107 +8,195 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every job pins its toolchain here; RUSTUP_TOOLCHAIN overrides
+  # rust-toolchain.toml.
+  RUSTUP_TOOLCHAIN: stable
 
 jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, ${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04-arm is aarch64 Linux; macos-latest is Apple Silicon.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        include:
+          - name: default
+            flags: ""
+          - name: all-features
+            flags: "--all-features"
+          - name: no-default-features
+            flags: "--no-default-features"
+        name: [default, all-features, no-default-features]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: Clippy (pedantic)
+        shell: bash
+        run: cargo clippy --locked --all-targets ${{ matrix.flags }} -- -D warnings -W clippy::pedantic
+      # Includes tests/real_signals.rs: real SIGUSR1 / SIGUSR2 / SIGHUP /
+      # SIGTERM / SIGINT / SIGPIPE on Unix and CTRL_BREAK on Windows,
+      # delivered to child processes.
+      - name: Test
+        shell: bash
+        run: cargo test --locked ${{ matrix.flags }}
+
+  features:
+    name: Each feature alone (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build (default features)
-        run: cargo build --verbose
-      - name: Test (default features)
-        run: cargo test --verbose
-
-      - name: Build (no default features)
-        run: cargo build --no-default-features --verbose
-
-      - name: Build (all features)
-        run: cargo build --all-features --verbose
-      - name: Test (all features)
-        run: cargo test --all-features --verbose
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: Clippy and test every feature on its own
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in std tokio agnostic smol ctrlc-fallback async-std tracing tokio-util "std,tokio,tracing,tokio-util"; do
+            echo "::group::--features $f"
+            cargo clippy --locked --all-targets --no-default-features --features "$f" -- -D warnings -W clippy::pedantic
+            cargo test --locked --no-default-features --features "$f"
+            echo "::endgroup::"
+          done
 
-  fmt:
-    name: Rustfmt
+  cross:
+    name: Cross-target check (library)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-freebsd
+          - x86_64-unknown-netbsd
+          - x86_64-apple-darwin
+          - i686-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  docs:
-    name: Doc build
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: "-D warnings"
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+          components: clippy
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --all-features --no-deps
+      - name: Clippy (library, every back-end)
+        run: |
+          set -euo pipefail
+          for f in "" "--all-features" "--no-default-features --features std,agnostic" "--no-default-features"; do
+            cargo clippy --locked --lib --target ${{ matrix.target }} $f -- -D warnings -W clippy::pedantic
+          done
 
   msrv:
-    name: MSRV (Rust 1.75)
+    name: MSRV (Rust 1.85)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.85"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      # The library (what downstream users build) for every back-end.
+      # Dev-dependencies are excluded: the benchmark harness needs 1.86.
+      - name: Check library on the MSRV
+        run: |
+          set -euo pipefail
+          for f in "" "--all-features" "--no-default-features" "--no-default-features --features std,agnostic" "--no-default-features --features std,tokio"; do
+            cargo check --locked --lib $f
+          done
+
+  docs:
+    name: Docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.75
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: rustdoc (stable, all features)
+        run: cargo doc --locked --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: rustdoc (docs.rs configuration)
+        run: cargo doc --locked --all-features --no-deps
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+          RUSTDOCFLAGS: "--cfg docsrs -D warnings"
 
-      # Regenerate Cargo.lock so transitive resolution starts from
-      # the current crates.io index. Then pin transitive deps that
-      # have raised their MSRV above ours.
-      - name: Delete existing Cargo.lock
-        run: rm -f Cargo.lock
+  loom:
+    name: Loom (state machine model check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Loom
+        run: cargo test --lib --release --no-default-features --features std loom
+        env:
+          RUSTFLAGS: "--cfg loom"
 
-      - name: Regenerate Cargo.lock with MSRV
-        run: cargo generate-lockfile
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      # `--target` keeps the sanitizer flags off build scripts and proc
+      # macros; `-Zbuild-std` instruments the standard library too.
+      - name: ASan
+        run: >-
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu
+          --all-features --lib --tests
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+          ASAN_OPTIONS: "detect_leaks=1"
 
-      # Cargo 1.75 lacks the MSRV-aware resolver (stabilized in 1.84),
-      # so newly published versions can break the regenerated lockfile.
-      # `async-lock 3.4.x` raised its MSRV to 1.85 in early 2026; it
-      # only appears when the `async-std` feature is enabled, which is
-      # excluded from MSRV coverage below, but we pin defensively in
-      # case the resolver pulls it in via another optional path.
-      # Drop these pins when MSRV is raised.
-      - name: Pin MSRV-incompatible transitive deps
+  semver:
+    name: SemVer (cargo-semver-checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+
+  security:
+    name: Security (audit + deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: Audit (committed lockfile)
+        run: cargo audit
+      - name: Deny
+        run: cargo deny check
+      # What a new downstream user would resolve today.
+      - name: Audit (fresh resolution)
         run: |
-          cargo update -p async-lock@3.4.2 --precise 3.3.0 || true
-
-      # MSRV is validated against the minimum realistic feature set
-      # (the `tokio` default plus `ctrlc-fallback`). The `async-std`
-      # feature pulls in `async-lock`, `polling`, and `rustix` versions
-      # that have raised their MSRV beyond 1.75 and is excluded from
-      # MSRV coverage; consumers who need `async-std` should pin their
-      # own toolchain to a newer minor.
-      - name: Check MSRV compatibility (lib, no default features)
-        run: cargo check --lib --no-default-features --features "std"
-
-      - name: Check MSRV compatibility (lib, default features)
-        run: cargo check --lib
-
-      - name: Check MSRV compatibility (lib, default + ctrlc-fallback)
-        run: cargo check --lib --features "ctrlc-fallback"
+          cargo generate-lockfile
+          cargo audit

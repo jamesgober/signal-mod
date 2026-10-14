@@ -1,0 +1,61 @@
+# cargo-deny configuration for signal-mod.
+# Schema reference: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+
+[graph]
+all-features = true
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# No ignores. The async-std feature no longer depends on async-std
+# (RUSTSEC-2025-0052) or on `instant` (RUSTSEC-2024-0384).
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+]
+confidence-threshold = 0.93
+exceptions = []
+# The allowlist is the portfolio-wide policy; not every license on it
+# appears in this crate's graph.
+unused-allowed-license = "allow"
+
+[bans]
+# Duplicates are reported, not fatal: they come from dev-only crates
+# (criterion, axum, smol) and never reach a downstream build.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = [
+    # Discontinued (RUSTSEC-2025-0052); the `async-std` feature is an alias
+    # of the agnostic back-end and must never pull the crate back in.
+    { crate = "async-std", reason = "discontinued, RUSTSEC-2025-0052" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
