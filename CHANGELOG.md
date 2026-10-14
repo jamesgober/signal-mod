@@ -122,7 +122,8 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   `build()`, so `run_hooks` hands off to it instead of spawning a thread
   (SM2-010). The standby records its process id: in a process forked
   after `build()` (which does not inherit the thread) the run starts a
-  fresh worker instead of waiting forever (SM2-016).
+  fresh worker instead of waiting forever, and never uses or drops the
+  parent's channel (on macOS that crashed the child) (SM2-016).
 - `install()` picks the back-end at call time (Tokio inside a Tokio
   runtime, otherwise the agnostic back-end) and is all-or-nothing:
   every stream is registered before any listener starts (SM-014).

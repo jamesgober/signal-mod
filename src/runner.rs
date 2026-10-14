@@ -385,11 +385,41 @@ pub(crate) struct HookRunner {
     state: Mutex<RunState>,
     done: Condvar,
     /// A parked worker thread started at build time, so that running the
-    /// hooks does not pay for a thread spawn, with the id of the process
-    /// that started it: after `fork` the thread does not exist in the
-    /// child, so it is only used by the same process. `None` without
-    /// hooks, once used, or if it could not be spawned.
-    standby: Mutex<Option<(u32, mpsc::Sender<Assignment>)>>,
+    /// hooks does not pay for a thread spawn. Only used by the process
+    /// that started it (see [`Standby`]). `None` without hooks, once
+    /// used, or if it could not be spawned.
+    standby: Mutex<Option<Standby>>,
+}
+
+/// The parked worker's channel, with the id of the process that started
+/// the worker.
+///
+/// After `fork` the worker thread does not exist in the child, but the
+/// channel's memory does, including the parker of the (parent's) thread
+/// blocked in `recv`. Dropping the sender would wake that thread, which
+/// in the child means touching another process's synchronization state
+/// (on Apple platforms a dispatch semaphore whose Mach port is not
+/// inherited, which crashes the child). So a child never uses or drops
+/// it: the sender is leaked there instead (one small allocation, once).
+struct Standby {
+    pid: u32,
+    tx: Option<mpsc::Sender<Assignment>>,
+}
+
+impl Standby {
+    fn is_ours(&self) -> bool {
+        self.pid == std::process::id()
+    }
+}
+
+impl Drop for Standby {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            if !self.is_ours() {
+                core::mem::forget(tx);
+            }
+        }
+    }
 }
 
 impl fmt::Debug for HookRunner {
@@ -404,7 +434,7 @@ impl fmt::Debug for HookRunner {
 
 /// Start a parked worker that runs one assignment, or exits when the
 /// runner (and with it the sender) is dropped first.
-fn spawn_standby() -> Option<(u32, mpsc::Sender<Assignment>)> {
+fn spawn_standby() -> Option<Standby> {
     let (tx, rx) = mpsc::channel::<Assignment>();
     let spawned = thread::Builder::new()
         .name("signal-mod-hook".into())
@@ -415,7 +445,10 @@ fn spawn_standby() -> Option<(u32, mpsc::Sender<Assignment>)> {
             }
         });
     match spawned {
-        Ok(_detached) => Some((std::process::id(), tx)),
+        Ok(_detached) => Some(Standby {
+            pid: std::process::id(),
+            tx: Some(tx),
+        }),
         Err(error) => {
             sm_warn!(error = %error, "could not pre-spawn the hook worker; it will start on demand");
             drop(error);
@@ -637,10 +670,17 @@ impl HookRunner {
             lock(&run.progress).finished = true;
             return false;
         }
-        let standby = lock(&self.standby)
-            .take()
-            .filter(|(pid, _)| *pid == std::process::id());
-        if let Some((_, standby)) = standby {
+        // A standby from another process (we are a forked child) stays
+        // where it is, untouched, and is leaked when the runner drops.
+        let standby = {
+            let mut slot = lock(&self.standby);
+            if slot.as_ref().is_some_and(Standby::is_ours) {
+                slot.take().and_then(|mut s| s.tx.take())
+            } else {
+                None
+            }
+        };
+        if let Some(standby) = standby {
             let assignment = Assignment {
                 runner: Arc::clone(self),
                 run: Arc::clone(run),
@@ -955,7 +995,10 @@ mod tests {
     /// ever starts on it.
     fn with_dead_standby(r: &HookRunner) -> mpsc::Receiver<Assignment> {
         let (tx, rx) = mpsc::channel::<Assignment>();
-        *lock(&r.standby) = Some((std::process::id(), tx));
+        *lock(&r.standby) = Some(Standby {
+            pid: std::process::id(),
+            tx: Some(tx),
+        });
         rx
     }
 
@@ -994,8 +1037,11 @@ mod tests {
     #[test]
     fn test_standby_from_another_process_is_not_used() {
         let r = runner(vec![Box::new(hook_from_fn("h", 0, |_| {}))], 5_000, 10_000);
-        let (tx, _parked) = mpsc::channel::<Assignment>();
-        *lock(&r.standby) = Some((std::process::id().wrapping_add(1), tx));
+        let (tx, parked) = mpsc::channel::<Assignment>();
+        *lock(&r.standby) = Some(Standby {
+            pid: std::process::id().wrapping_add(1),
+            tx: Some(tx),
+        });
         let start = Instant::now();
         let report = r.run_blocking(ShutdownReason::Requested, &RuntimeContext::default());
         assert_eq!(report.completed(), 1);
@@ -1005,6 +1051,15 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+        // The foreign channel was neither used nor dropped.
+        assert!(parked.try_recv().is_err());
+        let mut slot = lock(&r.standby);
+        let Some(foreign) = slot.as_mut() else {
+            panic!("the foreign standby must be left in place");
+        };
+        assert!(!foreign.is_ours());
+        // Hand it back to this process so the test does not leak it.
+        foreign.pid = std::process::id();
     }
 
     #[test]
