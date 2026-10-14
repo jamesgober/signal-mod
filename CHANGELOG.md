@@ -6,6 +6,16 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Fixed
+
+### Security
+
+## [2.0.0] - 2026-10-14
+
 Major release driven by the 2026-10-13 audit of 1.0.0 (findings SM-001
 to SM-023) and the re-audit of the 2.0.0 candidate (SM2-001 to
 SM2-015). Upgrade notes: `docs/MIGRATION.md`.
@@ -405,7 +415,8 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/signal-mod/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/signal-mod/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/jamesgober/signal-mod/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/jamesgober/signal-mod/compare/v0.9.1...v1.0.0
 [0.9.1]: https://github.com/jamesgober/signal-mod/releases/tag/v0.9.1
 
