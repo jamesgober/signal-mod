@@ -156,7 +156,11 @@ impl ServiceStatus {
     }
 
     #[cfg(not(windows))]
-    #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
+    #[allow(
+        clippy::unused_self,
+        clippy::needless_pass_by_value,
+        clippy::unnecessary_wraps
+    )]
     fn send(&self, _report: Option<Report>) -> io::Result<()> {
         Ok(())
     }
