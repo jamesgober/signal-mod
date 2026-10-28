@@ -123,6 +123,10 @@ mod waitlist;
 #[cfg(all(test, loom))]
 mod loom_tests;
 
+#[cfg(feature = "service")]
+#[cfg_attr(docsrs, doc(cfg(feature = "service")))]
+pub mod service;
+
 pub use crate::coord::{Coordinator, CoordinatorBuilder, Statistics};
 pub use crate::dispatch::{Recv, SignalSubscription};
 pub use crate::error::{Error, Result};

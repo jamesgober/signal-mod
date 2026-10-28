@@ -17,8 +17,8 @@ use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Sub, SubAssign};
 /// | `Quit`       | SIGQUIT  | `CTRL_BREAK_EVENT`                           |
 /// | `Hangup`     | SIGHUP   | `CTRL_LOGOFF_EVENT`, `CTRL_SHUTDOWN_EVENT`   |
 /// | `Pipe`       | SIGPIPE  | never delivered                              |
-/// | `User1`      | SIGUSR1  | never delivered                              |
-/// | `User2`      | SIGUSR2  | never delivered                              |
+/// | `User1`      | SIGUSR1  | service control code 128 (feature `service`) |
+/// | `User2`      | SIGUSR2  | `SERVICE_CONTROL_PARAMCHANGE` (`service`)    |
 ///
 /// Windows caveats, from the `HandlerRoutine` documentation:
 ///

@@ -1,6 +1,6 @@
 [package]
 name = "signal-mod"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.85"
 readme = "README.md"
@@ -87,6 +87,13 @@ tokio = ["dep:tokio", "dep:signal-hook"]
 # Windows: a console control handler registered through windows-sys.
 agnostic = ["dep:signal-hook", "dep:windows-sys"]
 
+# Windows service control (`signal_mod::service`): run as a service under
+# the service control manager, with stop, shutdown, parameter-change, and
+# dump controls delivered to every coordinator as signals. Brings no crate
+# beyond windows-sys (Windows only); on other platforms `service::run`
+# reports `Unsupported`.
+service = ["dep:windows-sys", "windows-sys/Win32_System_Services"]
+
 # Convenience alias for smol users: the agnostic back-end.
 smol = ["agnostic"]
 
@@ -130,11 +137,15 @@ libc = "0.2.155"
 signal-hook = { version = "0.4", optional = true, default-features = false, features = ["iterator"] }
 
 [target.'cfg(windows)'.dependencies]
-# Optional (feature `agnostic`). `SetConsoleCtrlHandler`, for the
-# agnostic back-end's own console handler when the `tokio` feature (and
-# with it Tokio's shared handler) is not enabled. Already in every Tokio
-# build on Windows.
+# Optional (features `agnostic`, `service`). `SetConsoleCtrlHandler`, for
+# the agnostic back-end's own console handler when the `tokio` feature (and
+# with it Tokio's shared handler) is not enabled, and the service control
+# API for `service`. Already in every Tokio build on Windows.
 windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[[example]]
+name = "windows_service"
+required-features = ["service", "agnostic"]
 
 [dev-dependencies]
 # Benchmark harness. Default features off: no rayon / plotters.

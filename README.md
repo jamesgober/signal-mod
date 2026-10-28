@@ -94,6 +94,7 @@ signal-mod = { version = "2", features = ["tracing", "tokio-util"] }
 | `tokio`          | yes     | `install()` inside a Tokio runtime uses `tokio::signal` listener tasks.                      |
 | `agnostic`       | no      | `install()` anywhere: a listener thread (Windows without `tokio`: a console control handler). |
 | `smol`           | no      | Alias of `agnostic`.                                                                        |
+| `service`        | no      | Windows service control (`signal_mod::service`): stop, shutdown, parameter-change, and dump controls as signals; status reports. `Unsupported` elsewhere. |
 | `ctrlc-fallback` | no      | 1.x name, now an alias of `agnostic` (covers every signal, not just Ctrl+C).                |
 | `async-std`      | no      | Deprecated alias of `agnostic`. async-std is discontinued; the crate is no longer pulled in. |
 | `tracing`        | no      | `tracing` events for signals, installs, hooks (start / finish / panic / timeout), escalation. |
