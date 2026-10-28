@@ -165,6 +165,26 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
           RUSTDOCFLAGS: "--cfg docsrs -D warnings"
 
+  service:
+    name: Windows service (sc create / start / control / stop)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+      - name: Toolchain in use
+        run: rustc -V && cargo -V
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the example service
+        run: cargo build --locked --example windows_service --no-default-features --features std,agnostic,service
+      # Installs the example as a real service (the runner is an
+      # administrator), drives it with sc.exe, checks its log and exit
+      # code, and always deletes the service.
+      - name: Service test
+        shell: pwsh
+        run: ./.github/scripts/service-test.ps1 -Exe target/debug/examples/windows_service.exe
+
   loom:
     name: Loom (state machine model check)
     runs-on: ubuntu-latest

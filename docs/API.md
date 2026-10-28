@@ -832,6 +832,56 @@ assert_eq!(signal_mod::VERSION, env!("CARGO_PKG_VERSION"));
 
 ---
 
+## `service`
+
+**Since** 2.1.0 · feature `service`
+
+```rust,ignore
+pub fn run<F>(name: &str, service: F) -> std::io::Result<()>
+where
+    F: FnOnce(&ServiceStatus) -> u32 + Send + 'static;
+
+pub struct ServiceStatus { /* the status machine and the SCM handle */ }
+impl ServiceStatus {
+    pub fn starting(&self, wait_hint: Duration) -> std::io::Result<()>;
+    pub fn running(&self) -> std::io::Result<()>;
+    pub fn stopping(&self, wait_hint: Duration) -> std::io::Result<()>;
+}
+
+pub const CONTROL_DUMP: u32 = 128;
+```
+
+Runs the process as a Windows service. Call `run` from the main thread
+after installing the program's coordinators; it blocks until the
+service has stopped. The service control manager calls `service` on a
+thread of its own; the service starts in `START_PENDING`, reports
+`RUNNING` with `running()`, `STOP_PENDING` with `stopping()` (each call
+a new checkpoint), and `STOPPED` with the value `service` returns as
+its exit code (`0` for success; anything else is reported as a
+service-specific error code). A panic in `service` is reported as exit
+code `1` and then resumed on the caller.
+
+| Control code | Delivered to every installed coordinator as |
+| --- | --- |
+| `SERVICE_CONTROL_STOP`, `SHUTDOWN`, `PRESHUTDOWN` | `Signal::Terminate` (after `STOP_PENDING` with a 30-second wait hint) |
+| `SERVICE_CONTROL_PARAMCHANGE` | `Signal::User2` |
+| `CONTROL_DUMP` (128) | `Signal::User1` |
+| `SERVICE_CONTROL_INTERROGATE` | (the current status is reported again) |
+| anything else | refused with `ERROR_CALL_NOT_IMPLEMENTED` |
+
+Controls are accepted only while the service is running. On Windows
+nothing else produces `User1` or `User2`, so a program adds them to its
+notify set to receive reload and dump requests.
+
+Errors: on Windows the OS error from `StartServiceCtrlDispatcherW`
+(`ERROR_FAILED_SERVICE_CONTROLLER_CONNECT`, 1063, means the process was
+not started by the service control manager: run in the foreground
+instead), `InvalidInput` for a name with a NUL character, `AlreadyExists`
+when a service already runs in this process. Elsewhere,
+`io::ErrorKind::Unsupported`.
+
+See `examples/windows_service.rs`.
+
 ## Platform behavior
 
 **Unix.** Numbers come from `libc` for the compiled target. The Tokio

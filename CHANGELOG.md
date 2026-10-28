@@ -6,13 +6,27 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-28
+
+Additive: Windows service control. No breaking change; MSRV unchanged
+(1.85); no new crate (windows-sys gains its `Win32_System_Services`
+feature when `service` is enabled).
+
 ### Added
 
-### Changed
-
-### Fixed
-
-### Security
+- Feature `service` and module `signal_mod::service`: `service::run(name,
+  body)` connects the process to the service control manager and runs
+  `body` on the thread the manager provides, with a `ServiceStatus`
+  (`starting`, `running`, `stopping`; `STOPPED` with the body's exit code
+  when it returns). Stop, shutdown, and preshutdown controls are
+  delivered to every installed `Coordinator` as `Signal::Terminate`
+  (after reporting `STOP_PENDING`); `SERVICE_CONTROL_PARAMCHANGE` as
+  `Signal::User2` and user control code 128 (`service::CONTROL_DUMP`) as
+  `Signal::User1`, for reload and dump. On other platforms `service::run`
+  returns `io::ErrorKind::Unsupported`.
+- `examples/windows_service.rs`, and a CI job that installs it as a real
+  service, drives it with `sc.exe`, checks its log and exit code, and
+  always deletes it.
 
 ## [2.0.0] - 2026-10-14
 

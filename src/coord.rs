@@ -468,6 +468,10 @@ impl Coordinator {
         }
         let registration = install::install(&self.dispatcher, self.signals | self.notify)?;
         *installation = Some(registration);
+        // Service control codes reach this coordinator too, whatever
+        // back-end it installed.
+        #[cfg(all(windows, feature = "service"))]
+        crate::service::registry::register(&self.dispatcher, self.signals | self.notify);
         Ok(())
     }
 
@@ -483,6 +487,8 @@ impl Coordinator {
         match registration {
             Some(registration) => {
                 registration.uninstall();
+                #[cfg(all(windows, feature = "service"))]
+                crate::service::registry::unregister(&self.dispatcher);
                 true
             }
             None => false,
