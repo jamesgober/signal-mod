@@ -24,9 +24,8 @@ use windows_sys::Win32::System::Services::{
 };
 use windows_sys::core::PWSTR;
 
-use super::{
-    Action, Body, ERROR_CALL_NOT_IMPLEMENTED, Machine, NO_ERROR, Report, ServiceStatus, action,
-};
+use super::state::{Action, ERROR_CALL_NOT_IMPLEMENTED, Machine, NO_ERROR, Report, action};
+use super::{Body, ServiceStatus};
 use crate::signal::Signal;
 
 /// How long the SCM waits after a stop control before the program's
