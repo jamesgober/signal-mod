@@ -146,7 +146,7 @@ impl Drop for Dispatcher {
 /// `Terminate` (console close) and `Hangup` (logoff, system shutdown) are
 /// sent by the OS, which ends the process by itself after its grace
 /// period; ending it sooner only cuts the hooks short. A service also gets
-/// SERVICE_CONTROL_SHUTDOWN (`Terminate`) and CTRL_SHUTDOWN_EVENT
+/// `SERVICE_CONTROL_SHUTDOWN` (`Terminate`) and `CTRL_SHUTDOWN_EVENT`
 /// (`Hangup`) for one machine shutdown: neither is a second request.
 const fn may_escalate(sig: Signal) -> bool {
     if cfg!(windows) {

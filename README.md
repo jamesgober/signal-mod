@@ -309,6 +309,30 @@ the back-to-back comparison run.
 - `wait_blocking_timeout` with a sub-millisecond budget measures the
   Windows timer granularity (about 15.6 ms), not the primitive.
 
+Installation, delivery and idle cost, measured on 2026-11-04 on the same
+machine (Windows 11, and WSL2 Ubuntu for Linux), Rust 1.99.0, again under
+other builds:
+
+| Operation                                                   | Windows  | Linux (WSL2) |
+| ----------------------------------------------------------- | -------- | ------------ |
+| `install` + `uninstall`, agnostic, no `tokio` feature        | 74 ns    | 95 us        |
+| `install` + `uninstall`, agnostic, with `tokio` feature      | 41-70 us | n/a          |
+| real signal, `raise` to `recv_blocking` (agnostic)          | n/a      | 91 us        |
+| `run_hooks_async` without hooks (was 64 us on Windows)      | 160 ns   | 278 ns       |
+| context switches of an idle installed coordinator, per second | 0 (by construction) | 0 (`tests/idle.rs`) |
+
+- Installing on Windows without the `tokio` feature adds an entry behind
+  the console handler, which is registered with the OS once per process.
+  With `tokio`, or on Unix, `install` starts the listener thread (and on
+  Unix creates a self-pipe and one `sigaction` per signal): a once per
+  process cost.
+- The Linux delivery figure is mostly the listener thread's wake-up
+  under WSL2's virtualised scheduler; treat it as an upper bound.
+- Idle, signal-mod's threads block in the kernel with no timeout (the
+  listener in `read` on signal-hook's self-pipe, the parked hook worker
+  in a channel receive, the Windows listener in `park`), so they are
+  never woken until a signal arrives or a run starts.
+
 
 ## Platform support
 

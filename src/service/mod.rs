@@ -107,7 +107,9 @@ enum Sink {
 }
 
 impl Sink {
+    // Off Windows (outside tests) there is no sink: nothing is sent.
     #[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+    #[cfg_attr(not(any(windows, test)), allow(unused_variables))]
     fn send(&self, report: &Report) -> io::Result<()> {
         match *self {
             #[cfg(windows)]
