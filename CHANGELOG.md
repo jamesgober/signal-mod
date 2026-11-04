@@ -6,6 +6,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-11-04
+
 Pre-1.0 review of the whole crate (security, edge cases, idle cost). No
 public API change; MSRV unchanged (1.85); no new dependency.
 
@@ -72,6 +74,11 @@ public API change; MSRV unchanged (1.85); no new dependency.
   coordinator's threads see no context switch while idle (Linux).
 - Benchmarks for `install` + `uninstall`, `run_hooks_async` without
   hooks, and real-signal delivery on Unix (raise to `recv_blocking`).
+
+### Lockfile
+
+- async-executor 1.14.1 (1.14.0 was yanked; development only, under
+  `smol`).
 
 ## [2.1.0] - 2026-10-28
 
@@ -519,7 +526,9 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/signal-mod/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/signal-mod/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/jamesgober/signal-mod/compare/v2.1.0...v2.1.1
+[2.1.0]: https://github.com/jamesgober/signal-mod/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/jamesgober/signal-mod/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/jamesgober/signal-mod/compare/v0.9.1...v1.0.0
 [0.9.1]: https://github.com/jamesgober/signal-mod/releases/tag/v0.9.1
