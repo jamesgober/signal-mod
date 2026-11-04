@@ -89,3 +89,18 @@ pub(crate) fn wait_timeout<'a, T>(
         Err(poisoned) => poisoned.into_inner().0,
     }
 }
+
+/// Drop a panic payload without letting its destructor unwind.
+///
+/// A payload type whose `Drop` panics would otherwise unwind out of the
+/// code that just caught the first panic: a hook worker would die with
+/// its slot still `Running` (the run then waited for the hook's deadline,
+/// or forever without one), and a signal listener would stop delivering.
+/// A payload whose destructor panics is leaked instead, and so is the
+/// second payload, so this cannot recurse.
+pub(crate) fn drop_payload(payload: Box<dyn core::any::Any + Send>) {
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(payload)));
+    if let Err(nested) = dropped {
+        core::mem::forget(nested);
+    }
+}

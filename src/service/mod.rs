@@ -21,6 +21,14 @@
 //! add them to its notify set ([`CoordinatorBuilder::notify_signals`])
 //! to receive the reload and dump requests.
 //!
+//! A control never ends the process through
+//! [`force_exit_on_second_signal`](crate::CoordinatorBuilder::force_exit_on_second_signal):
+//! the SCM sends one stop, so a stop that finds shutdown already started
+//! is delivered like the first. After a stop the service reports
+//! `STOP_PENDING` and waits for the program: if no installed coordinator
+//! has `Terminate` in its sets, nothing acts on the stop and the service
+//! stays `STOP_PENDING` until the SCM gives up on it.
+//!
 //! On other platforms [`run`] returns [`io::ErrorKind::Unsupported`], so
 //! portable code can call it unconditionally and fall back to running in
 //! the foreground.
@@ -81,10 +89,39 @@ pub const CONTROL_DUMP: u32 = 128;
 /// call is a new checkpoint), and return the exit code from the closure:
 /// [`run`] reports `STOPPED` with it. A stop control reports
 /// `STOP_PENDING` by itself before delivering [`Signal::Terminate`](crate::Signal::Terminate).
+/// Reports from any thread reach the SCM in the order they were made, and
+/// nothing is reported after `STOPPED`.
 pub struct ServiceStatus {
     machine: Mutex<Machine>,
+    sink: Sink,
+}
+
+/// Where status reports go.
+enum Sink {
+    /// The service control manager.
     #[cfg(windows)]
-    handle: ffi::StatusHandle,
+    Scm(ffi::StatusHandle),
+    /// Unit tests: the reports in the order they were sent.
+    #[cfg(test)]
+    Record(Mutex<Vec<Report>>),
+}
+
+impl Sink {
+    #[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+    fn send(&self, report: &Report) -> io::Result<()> {
+        match *self {
+            #[cfg(windows)]
+            Self::Scm(ref handle) => handle.set(report),
+            #[cfg(test)]
+            Self::Record(ref sent) => {
+                match sent.lock() {
+                    Ok(mut guard) => guard.push(*report),
+                    Err(poisoned) => poisoned.into_inner().push(*report),
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for ServiceStatus {
@@ -103,6 +140,21 @@ impl ServiceStatus {
         }
     }
 
+    /// Apply `change` and send the report it produces, if any.
+    ///
+    /// The report is sent while the state is still locked, so reports
+    /// from the service's thread and from the control handler reach the
+    /// SCM in the order they were made: checkpoints never go backwards,
+    /// and nothing follows `STOPPED`. `SetServiceStatus` does not wait for
+    /// the control handler, so holding the lock across it cannot deadlock.
+    fn update(&self, change: impl FnOnce(&mut Machine) -> Option<Report>) -> io::Result<()> {
+        let mut machine = self.lock();
+        match change(&mut machine) {
+            Some(report) => self.sink.send(&report),
+            None => Ok(()),
+        }
+    }
+
     /// Still starting: the SCM waits up to `wait_hint` for the next
     /// report. Does nothing once the service is running or stopping.
     ///
@@ -110,8 +162,7 @@ impl ServiceStatus {
     ///
     /// The OS error from `SetServiceStatus`.
     pub fn starting(&self, wait_hint: Duration) -> io::Result<()> {
-        let report = self.lock().starting(wait_hint);
-        self.send(report)
+        self.update(|machine| machine.starting(wait_hint))
     }
 
     /// The service is serving: it now accepts stop, shutdown, and
@@ -121,8 +172,7 @@ impl ServiceStatus {
     ///
     /// The OS error from `SetServiceStatus`.
     pub fn running(&self) -> io::Result<()> {
-        let report = self.lock().running();
-        self.send(report)
+        self.update(Machine::running)
     }
 
     /// The service is stopping: the SCM waits up to `wait_hint` for the
@@ -132,37 +182,19 @@ impl ServiceStatus {
     ///
     /// The OS error from `SetServiceStatus`.
     pub fn stopping(&self, wait_hint: Duration) -> io::Result<()> {
-        let report = self.lock().stopping(wait_hint);
-        self.send(report)
+        self.update(|machine| machine.stopping(wait_hint))
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     fn stopped(&self, exit_code: u32) -> io::Result<()> {
-        let report = self.lock().stopped(exit_code);
-        self.send(report)
+        self.update(|machine| machine.stopped(exit_code))
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
-    fn current(&self) -> Report {
-        self.lock().report()
-    }
-
-    #[cfg(windows)]
-    fn send(&self, report: Option<Report>) -> io::Result<()> {
-        match report {
-            Some(report) => self.handle.set(&report),
-            None => Ok(()),
-        }
-    }
-
-    #[cfg(not(windows))]
-    #[allow(
-        clippy::unused_self,
-        clippy::needless_pass_by_value,
-        clippy::unnecessary_wraps
-    )]
-    fn send(&self, _report: Option<Report>) -> io::Result<()> {
-        Ok(())
+    /// Report the current status again (the first report, and the answer
+    /// to `SERVICE_CONTROL_INTERROGATE`); nothing once stopped.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    fn reannounce(&self) -> io::Result<()> {
+        self.update(|machine| machine.reannounce())
     }
 }
 
@@ -309,6 +341,77 @@ mod tests {
         let mut machine = Machine::new();
         let report = machine.starting(Duration::from_secs(u64::MAX)).unwrap();
         assert_eq!(report.wait_hint, u32::MAX);
+    }
+
+    fn recording() -> ServiceStatus {
+        ServiceStatus {
+            machine: Mutex::new(Machine::new()),
+            sink: Sink::Record(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn sent(status: &ServiceStatus) -> Vec<Report> {
+        match &status.sink {
+            Sink::Record(sent) => sent.lock().unwrap().clone(),
+            #[cfg(windows)]
+            Sink::Scm(_) => Vec::new(),
+        }
+    }
+
+    // Pre-1.0 review: a report was made under the status lock but sent
+    // after releasing it, so reports from the service's thread and the
+    // control handler's thread could reach the SCM out of order: a
+    // checkpoint going backwards, or a stale STOP_PENDING arriving after
+    // STOPPED.
+    #[test]
+    fn concurrent_reports_reach_the_scm_in_the_order_they_were_made() {
+        let status = std::sync::Arc::new(recording());
+        status.running().unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let status = std::sync::Arc::clone(&status);
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        status.stopping(Duration::from_secs(1)).unwrap();
+                        status.reannounce().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        status.stopped(0).unwrap();
+        status.reannounce().unwrap();
+        status.stopping(Duration::from_secs(1)).unwrap();
+
+        let sent = sent(&status);
+        let pending: Vec<u32> = sent
+            .iter()
+            .filter(|r| r.current_state == SERVICE_STOP_PENDING)
+            .map(|r| r.check_point)
+            .collect();
+        assert!(
+            pending.windows(2).all(|w| w[0] <= w[1]),
+            "checkpoints went backwards"
+        );
+        assert_eq!(pending.last().copied(), Some(4_000));
+        let last = sent.last().unwrap();
+        assert_eq!(last.current_state, SERVICE_STOPPED, "nothing after STOPPED");
+        assert_eq!(
+            sent.iter()
+                .filter(|r| r.current_state == SERVICE_STOPPED)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reannounce_repeats_the_status_until_stopped() {
+        let mut machine = Machine::new();
+        assert_eq!(machine.reannounce(), Some(machine.report()));
+        let _stopped = machine.stopped(0);
+        assert_eq!(machine.reannounce(), None);
     }
 
     #[cfg(not(windows))]

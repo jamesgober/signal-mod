@@ -1,5 +1,6 @@
-//! The process-wide Windows console control handler, shared by both
-//! back-ends.
+//! The process-wide Windows console control handler of the agnostic
+//! back-end, used only without the `tokio` feature (with it, both
+//! back-ends go through Tokio's handler; see `windows_events`).
 //!
 //! `SetConsoleCtrlHandler` takes a bare function pointer with no
 //! context argument, so the handler finds its coordinators through a
@@ -7,9 +8,9 @@
 //! touched under its mutex.
 //!
 //! Windows calls console handlers last-registered first and stops at the
-//! first one that returns `TRUE`. Routing every coordinator, Tokio or
-//! agnostic, through this one handler is what lets all of them receive
-//! each event (two separate handlers would hide events from each other).
+//! first one that returns `TRUE`. Routing every coordinator through this
+//! one handler is what lets all of them receive each event (one handler
+//! per coordinator would hide events from each other).
 //! It tells the five console events apart, and for `CTRL_CLOSE` /
 //! `CTRL_LOGOFF` / `CTRL_SHUTDOWN` it keeps the OS handler thread parked
 //! after delivering, because the OS terminates the process as soon as the

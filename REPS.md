@@ -235,7 +235,7 @@ pub const VERSION: &str;
 
 The crate is `#![deny(unsafe_code)]`. Signal installation is delegated to
 audited crates: `tokio::signal` (Unix), and `signal-hook` for the Unix
-agnostic back-end and default restoration. Two modules opt out locally,
+agnostic back-end and default restoration. Three modules opt out locally,
 each with a `// SAFETY:` justification on every block:
 
 - `install/console.rs` (Windows, agnostic back-end without the `tokio`
@@ -244,6 +244,15 @@ each with a `// SAFETY:` justification on every block:
 - `install/disposition.rs` (Unix): one read-only `sigaction` call (null
   new action) that reads a signal's disposition before signal-mod first
   installs it, so that only a default disposition is ever restored.
+- `service/ffi.rs` (Windows, feature `service`): the service control
+  dispatcher, `ServiceMain`, the control handler and `SetServiceStatus`.
+  Neither callback unwinds across the FFI boundary (panics are caught; a
+  panic in the service body is resumed on the caller of `service::run`).
+
+Code signal-mod calls but does not own (wakers, `tracing` subscribers,
+linked cancellation tokens, panic payload destructors) can panic; such a
+panic is contained where it happens, so it cannot cost other tasks their
+wake-up, kill a signal listener, or kill a hook worker.
 
 ## 6. MSRV policy
 
@@ -277,6 +286,11 @@ fresh dependent would resolve.
   `force_timeout` is a hard upper bound on a run, except when the OS
   refuses to create a thread (the remaining hooks then run inline and
   cannot be abandoned).
+- Idle: an installed coordinator's threads (signal listener, parked hook
+  worker) block in the kernel with no timeout, so an idle process sees
+  zero wake-ups from signal-mod (`tests/idle.rs` checks it on Linux).
+- `run_hooks_async` without hooks resolves on its first poll; it starts
+  no thread.
 - Every number in the README is produced by `benches/shutdown_bench.rs`.
 
 ## 8. Stability guarantees
@@ -308,7 +322,7 @@ Everything else is optional and feature-gated:
 | `libc`        | always, Unix only       | per-target signal numbers                                |
 | `tokio`       | `tokio`                 | listener tasks, runtime context for hooks (`rt`, `signal`) |
 | `signal-hook` | `tokio`, `agnostic` (Unix) | listener iterator; conditional default restoration    |
-| `windows-sys` | `agnostic` (Windows)    | `SetConsoleCtrlHandler`, only without the `tokio` feature |
+| `windows-sys` | `agnostic`, `service` (Windows) | `SetConsoleCtrlHandler` (only without the `tokio` feature); the service control API |
 | `tracing`     | `tracing`               | diagnostics                                              |
 | `tokio-util`  | `tokio-util`            | `CancellationToken` interop                              |
 
@@ -345,8 +359,10 @@ cross-cutting guide; `docs/MIGRATION.md` covers every breaking change.
 
 - Process supervision (spawning and managing child processes). That is
   `proc-daemon`'s job; it can build on this crate.
-- Service-manager integration (`sd_notify`, the Windows Service Control
-  Manager). Belongs in a separate adapter crate.
+- `sd_notify` and other service-manager protocols. Belongs in a separate
+  adapter crate. The one exception, since 2.1.0, is the Windows service
+  control manager (feature `service`): it is the only way a Windows
+  service is asked to stop, so it is a signal source, not an adapter.
 - Per-thread signal masks. The contract is process-global.
 - Async hook bodies (`async fn run`). Hooks are synchronous and can
   bridge to async cleanup through `run_hooks_async`; an async trait

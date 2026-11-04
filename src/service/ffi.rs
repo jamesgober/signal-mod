@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Services::{
 use windows_sys::core::PWSTR;
 
 use super::state::{Action, ERROR_CALL_NOT_IMPLEMENTED, Machine, NO_ERROR, Report, action};
-use super::{Body, ServiceStatus};
+use super::{Body, ServiceStatus, Sink};
 use crate::signal::Signal;
 
 /// How long the SCM waits after a stop control before the program's
@@ -168,11 +168,11 @@ fn serve() {
     }
     let status = Arc::new(ServiceStatus {
         machine: Mutex::new(Machine::new()),
-        handle: StatusHandle(handle),
+        sink: Sink::Scm(StatusHandle(handle)),
     });
     // The first report: START_PENDING. A failure here cannot be reported
     // anywhere but the SCM, which will time the start out.
-    let _reported = status.handle.set(&status.current());
+    let _reported = status.reannounce();
     *lock(&ACTIVE) = Some(Arc::clone(&status));
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| body(&status)));
     let exit_code = match outcome {
@@ -214,7 +214,7 @@ fn handle(control: u32) -> u32 {
         }
         Action::Interrogate => {
             if let Some(status) = &active {
-                let _reported = status.handle.set(&status.current());
+                let _reported = status.reannounce();
             }
             NO_ERROR
         }

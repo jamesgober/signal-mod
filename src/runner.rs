@@ -241,6 +241,7 @@ fn execute(hook: &dyn ShutdownHook, reason: ShutdownReason) -> (HookStatus, Opti
                 .downcast_ref::<&str>()
                 .map(|s| (*s).to_owned())
                 .or_else(|| payload.downcast_ref::<String>().cloned());
+            crate::sync::drop_payload(payload);
             (HookStatus::Panicked, message)
         }
     }
@@ -814,10 +815,19 @@ impl HookRunner {
                 }
                 RunState::Idle => {
                     let mut waiters = WaitList::default();
-                    waiters.register(key, cx.waker());
+                    if !self.slots.is_empty() {
+                        waiters.register(key, cx.waker());
+                    }
                     *state = RunState::Running(waiters);
                 }
             }
+        }
+        if self.slots.is_empty() {
+            // Nothing can block: make the (empty) report here instead of
+            // paying for a supervisor thread (about 60 us on Windows).
+            let report = self.supervise(reason, &RuntimeContext::default());
+            self.publish(report.clone());
+            return Poll::Ready(report);
         }
         let ctx = RuntimeContext::capture();
         let runner = Arc::clone(self);

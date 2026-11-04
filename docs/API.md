@@ -30,7 +30,9 @@ For the design contract see [`REPS.md`](../REPS.md); for upgrading from
 - [`shutdown_signal`](#shutdown_signal) and [`ShutdownSignal`](#shutdownsignal)
 - [`Error`](#error) and [`Result`](#result)
 - [`VERSION`](#version)
+- [`service`](#service) (feature `service`)
 - [Platform behavior](#platform-behavior)
+- [Known limitations](#known-limitations)
 - [Performance](#performance)
 
 ---
@@ -366,7 +368,9 @@ Contract:
   abandoned hook keeps running on its thread until it returns, holding
   whatever locks it took: keep critical sections in hooks short, or
   check [`HookContext`](#hookcontext) between steps.
-- A panic is caught and reported with its message.
+- A panic is caught and reported with its message. A panic payload
+  whose own destructor panics is leaked instead of dropped, so it cannot
+  take the worker thread down with it.
 
 ```rust
 use std::time::Duration;
@@ -531,7 +535,7 @@ fn main() -> signal_mod::Result<()> {
 | `notify_signals(set)`               | empty                   | signals delivered to subscribers only                 |
 | `graceful_timeout(d)`               | 5 s                     | graceful phase budget, from the start of the hook run |
 | `force_timeout(d)`                  | 10 s                    | total budget for the run, including the force phase   |
-| `force_exit_on_second_signal(bool)` | `false`                 | a second shutdown signal ends the process (re-raised on Unix, `exit_code()` on Windows) |
+| `force_exit_on_second_signal(bool)` | `false`                 | a second shutdown signal ends the process (re-raised on Unix, `exit_code()` on Windows); on Windows only Ctrl+C and Ctrl+Break escalate, never console close, logoff, shutdown or a service control |
 | `hook(h)`                           | none                    | register a hook                                       |
 | `build()`                           |                         | sort hooks once, create the coordinator               |
 
@@ -873,6 +877,14 @@ Controls are accepted only while the service is running. On Windows
 nothing else produces `User1` or `User2`, so a program adds them to its
 notify set to receive reload and dump requests.
 
+A control never triggers `force_exit_on_second_signal`: the service
+control manager sends one stop, so a stop that finds shutdown already
+started is delivered like the first, and the service still reports
+`STOPPED`. Status reports from any thread (the service's, the control
+handler's) reach the manager in the order they were made, and nothing is
+reported after `STOPPED`. If no installed coordinator has `Terminate` in
+its sets, nothing acts on a stop and the service stays `STOP_PENDING`.
+
 Errors: on Windows the OS error from `StartServiceCtrlDispatcherW`
 (`ERROR_FAILED_SERVICE_CONTROLLER_CONNECT`, 1063, means the process was
 not started by the service control manager: run in the foreground
@@ -911,10 +923,50 @@ console window closing, `Hangup` logoff or system shutdown (delivered to
 services only). After `CTRL_CLOSE_EVENT` the OS terminates the process
 about 5 seconds later; both back-ends hold the OS handler thread so that
 window is usable, so keep `force_timeout` under it if console close
-matters. `Pipe`, `User1` and `User2` are never delivered and are left out
-of `installed_signals()`.
+matters. The console never delivers `Pipe`, `User1` or `User2`, so they
+are left out of `installed_signals()`; with the `service` feature, service
+controls deliver `User1` (dump) and `User2` (parameter change).
 
 **Other targets.** `install` succeeds with an empty `installed_signals()`.
+
+**Panics.** Code signal-mod calls but does not own (an executor's waker,
+a `tracing` subscriber, a linked `CancellationToken`) can panic. Such a
+panic is contained where it happens: the other waiting tasks are still
+woken, and the listener thread or task that delivered the signal keeps
+delivering. Without that, one faulty waker could leave shutdown signals
+unhandled for the rest of the process.
+
+## Known limitations
+
+Each of these is a property of the OS or of a library signal-mod
+builds on, and is kept deliberately:
+
+- **Unix, a handler added after signal-mod.** If other code registers a
+  handler for a shutdown signal through signal-hook or Tokio after
+  signal-mod first installed it, the restored default action still
+  terminates the process once the last coordinator is gone: signal-hook
+  offers no way to see the other registrations, and leaving the signal
+  without its default would swallow SIGTERM, the worse failure. Keep the
+  coordinator alive for the life of the process in that case. (Code that
+  replaces the handler with `sigaction` directly is not affected.)
+- **Abandoned hooks keep running.** A timed-out hook runs on until it
+  returns, holding what it locked: safe Rust cannot stop a thread. It can
+  check `HookContext::is_abandoned()` to stop early.
+- **Tokio without its I/O driver.** Tokio panics inside `install` on a
+  runtime built without `enable_io()`; signal-mod turns the unwind into
+  an error, but a `panic = "abort"` binary aborts. Tokio has no way to ask
+  whether the driver is there.
+- **Windows console handler order.** Without the `tokio` feature,
+  signal-mod's console handler and other code's handlers can hide events
+  from each other (see above): that is how Windows dispatches console
+  events. Enable `tokio` when the application uses `tokio::signal`.
+- **fork.** `build()` starts a thread when hooks are registered. A child
+  forked after `build()` still runs its hooks, but only a built
+  coordinator is fork-safe: install it, wait on it, and run its hooks
+  after forking.
+- **Coalescing.** Like the OS, the back-ends report a signal once when
+  it arrives again before the listener has taken it, so two very quick
+  Ctrl+C presses can count as one for `force_exit_on_second_signal`.
 
 ---
 

@@ -486,6 +486,35 @@ mod tests {
         assert!(poll_once(&mut fut, &waker).is_ready());
     }
 
+    struct Explode;
+    impl Wake for Explode {
+        fn wake(self: std::sync::Arc<Self>) {
+            panic!("executor bug");
+        }
+    }
+
+    // Pre-1.0 review: a waker that panicked inside `trigger` unwound out
+    // of it, so the waiters after it were never woken, child scopes were
+    // never initiated, and the signal listener that called `trigger` died.
+    #[test]
+    fn test_panicking_waker_does_not_cost_other_waiters_their_wake_up() {
+        let inner = Inner::new();
+        let token = ShutdownToken::new(Arc::clone(&inner));
+        let (_child_trigger, child) = token.child();
+        let bad = Waker::from(std::sync::Arc::new(Explode));
+        let count = std::sync::Arc::new(Count(AtomicUsize::new(0)));
+        let good = Waker::from(std::sync::Arc::clone(&count));
+
+        let mut first = token.wait();
+        let mut second = token.wait();
+        assert!(poll_once(&mut first, &bad).is_pending());
+        assert!(poll_once(&mut second, &good).is_pending());
+        let triggered = std::panic::catch_unwind(|| inner.trigger(ShutdownReason::Requested));
+        assert!(matches!(triggered, Ok(true)), "trigger must not unwind");
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        assert!(child.is_initiated());
+    }
+
     #[test]
     fn test_shutdown_future_dropped_while_pending_unregisters() {
         let inner = Inner::new();
