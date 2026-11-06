@@ -12,9 +12,15 @@ feature-depth = 1
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-# No ignores. The async-std feature no longer depends on async-std
-# (RUSTSEC-2025-0052) or on `instant` (RUSTSEC-2024-0384).
-ignore = []
+# The async-std feature no longer depends on async-std (RUSTSEC-2025-0052)
+# or on `instant` (RUSTSEC-2024-0384). One ignore: `pin-utils` is
+# unmaintained (RUSTSEC-2026-0441, no fixed version) and reaches the tree
+# only through `loom`, a development dependency used by the `--cfg loom`
+# model tests; it is never part of a build of this crate. Drop the ignore
+# when a loom release stops depending on it.
+ignore = [
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils, through the dev-only loom model tests" },
+]
 
 [licenses]
 allow = [

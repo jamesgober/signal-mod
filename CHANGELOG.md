@@ -79,6 +79,9 @@ public API change; MSRV unchanged (1.85); no new dependency.
 
 - async-executor 1.14.1 (1.14.0 was yanked; development only, under
   `smol`).
+- `deny.toml` ignores RUSTSEC-2026-0441 (`pin-utils` unmaintained, no
+  fixed version), which reaches the tree only through the development
+  dependency `loom`.
 
 ## [2.1.0] - 2026-10-28
 
