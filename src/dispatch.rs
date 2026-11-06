@@ -58,14 +58,43 @@ impl Dispatcher {
     /// escalation is enabled, the process ends immediately (see
     /// [`escalate`]).
     pub(crate) fn deliver(&self, sig: Signal) {
-        sm_info!(signal = %sig, "signal received");
-        self.notify_subscribers(sig);
-        if !self.shutdown.contains(sig) {
-            return;
-        }
-        let first = self.trigger.trigger(ShutdownReason::Signal(sig));
-        if !first && self.escalate {
-            escalate(sig);
+        self.route(sig, self.escalate && may_escalate(sig));
+    }
+
+    /// Handle a signal that a service control produced: as
+    /// [`deliver`](Self::deliver), but never escalates.
+    ///
+    /// The service control manager sends a stop once (after it, the
+    /// service reports `STOP_PENDING` and accepts no further control), so
+    /// a stop that finds shutdown already initiated means the program
+    /// started shutting down on its own. Ending the process then would
+    /// skip the `STOPPED` report, and the manager would record a failure
+    /// and run the service's recovery actions.
+    #[cfg_attr(not(all(windows, feature = "service")), allow(dead_code))]
+    pub(crate) fn deliver_without_escalation(&self, sig: Signal) {
+        self.route(sig, false);
+    }
+
+    fn route(&self, sig: Signal, escalate_on_repeat: bool) {
+        // Called on a listener thread or task, or on an OS handler
+        // thread. Code reached from here that is not signal-mod's (a
+        // tracing subscriber, a task's waker, a linked cancellation
+        // token) must not unwind into the listener: it would die, and
+        // every later signal would be lost.
+        let routed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sm_info!(signal = %sig, "signal received");
+            self.notify_subscribers(sig);
+            if !self.shutdown.contains(sig) {
+                return;
+            }
+            let first = self.trigger.trigger(ShutdownReason::Signal(sig));
+            if !first && escalate_on_repeat {
+                escalate(sig);
+            }
+        }));
+        if let Err(payload) = routed {
+            sm_error!(signal = %sig, "delivering a signal panicked; the listener goes on");
+            crate::sync::drop_payload(payload);
         }
     }
 
@@ -107,6 +136,23 @@ impl Drop for Dispatcher {
         for sub in subs.iter().filter_map(Weak::upgrade) {
             sub.close();
         }
+    }
+}
+
+/// Whether a repeat of `sig` may end the process
+/// (`force_exit_on_second_signal`).
+///
+/// On Windows only Ctrl+C and Ctrl+Break, the keys a person presses.
+/// `Terminate` (console close) and `Hangup` (logoff, system shutdown) are
+/// sent by the OS, which ends the process by itself after its grace
+/// period; ending it sooner only cuts the hooks short. A service also gets
+/// `SERVICE_CONTROL_SHUTDOWN` (`Terminate`) and `CTRL_SHUTDOWN_EVENT`
+/// (`Hangup`) for one machine shutdown: neither is a second request.
+const fn may_escalate(sig: Signal) -> bool {
+    if cfg!(windows) {
+        matches!(sig, Signal::Interrupt | Signal::Quit)
+    } else {
+        true
     }
 }
 
@@ -382,6 +428,79 @@ mod tests {
             inner.reason(),
             Some(ShutdownReason::Signal(Signal::Terminate))
         );
+    }
+
+    // Pre-1.0 review: service controls must not reach the escalation path
+    // (a regression exits the test process with code 143).
+    #[test]
+    fn test_deliver_without_escalation_never_escalates() {
+        let inner = Inner::new();
+        let trigger = ShutdownTrigger::new(Arc::clone(&inner));
+        let d = Dispatcher::new(trigger, SignalSet::from(Signal::Terminate), true);
+        d.deliver_without_escalation(Signal::Terminate);
+        d.deliver_without_escalation(Signal::Terminate);
+        assert_eq!(
+            inner.reason(),
+            Some(ShutdownReason::Signal(Signal::Terminate))
+        );
+    }
+
+    // Pre-1.0 review: on Windows, `Terminate` (console close) and `Hangup`
+    // (logoff, system shutdown) are sent by the OS, which ends the process
+    // itself after its grace period. A service gets both
+    // SERVICE_CONTROL_SHUTDOWN (`Terminate`) and CTRL_SHUTDOWN_EVENT
+    // (`Hangup`) when the machine shuts down, so with escalation on, the
+    // second ended the process before its hooks ran. A regression exits the
+    // test process with code 129 or 143.
+    #[cfg(windows)]
+    #[test]
+    fn test_os_sent_console_events_do_not_escalate_on_windows() {
+        let inner = Inner::new();
+        let trigger = ShutdownTrigger::new(Arc::clone(&inner));
+        let d = Dispatcher::new(trigger, SignalSet::graceful(), true);
+        d.deliver(Signal::Terminate);
+        d.deliver(Signal::Hangup);
+        d.deliver(Signal::Terminate);
+        assert_eq!(
+            inner.reason(),
+            Some(ShutdownReason::Signal(Signal::Terminate))
+        );
+    }
+
+    #[test]
+    fn test_only_keyboard_signals_escalate_on_windows() {
+        for sig in Signal::ALL {
+            let expected = !cfg!(windows) || matches!(sig, Signal::Interrupt | Signal::Quit);
+            assert_eq!(may_escalate(sig), expected, "{sig}");
+        }
+    }
+
+    struct Explode;
+    impl std::task::Wake for Explode {
+        fn wake(self: Arc<Self>) {
+            panic!("executor bug");
+        }
+    }
+
+    // Pre-1.0 review: a panic reached from `deliver` (here a subscriber's
+    // waker) unwound into the listener thread or task, which died, and
+    // every later signal was lost.
+    #[test]
+    fn test_deliver_survives_a_panicking_waker_and_keeps_delivering() {
+        let (inner, d) = dispatcher(SignalSet::from(Signal::Terminate));
+        let mut sub = d.subscribe();
+        let waker = std::task::Waker::from(Arc::new(Explode));
+        let mut cx = Context::from_waker(&waker);
+        {
+            let mut recv = sub.recv();
+            assert!(Pin::new(&mut recv).poll(&mut cx).is_pending());
+            let delivered = std::panic::catch_unwind(|| d.deliver(Signal::User1));
+            assert!(delivered.is_ok(), "deliver must not unwind");
+        }
+        assert_eq!(sub.try_recv(), Some(Signal::User1));
+        d.deliver(Signal::Terminate);
+        assert!(inner.is_initiated());
+        assert_eq!(sub.try_recv(), Some(Signal::Terminate));
     }
 
     #[test]

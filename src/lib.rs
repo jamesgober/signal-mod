@@ -56,6 +56,7 @@
 //! | `tokio`          | yes     | [`Coordinator::install`] inside a Tokio runtime uses `tokio::signal`. |
 //! | `agnostic`       | no      | A listener thread; works with any executor or none.                  |
 //! | `smol`           | no      | Alias of `agnostic`.                                                 |
+//! | `service`        | no      | Windows service control (`service` module); `Unsupported` elsewhere. |
 //! | `ctrlc-fallback` | no      | 1.x name, now an alias of `agnostic`.                                |
 //! | `async-std`      | no      | Deprecated alias of `agnostic`; no longer depends on async-std.     |
 //! | `tracing`        | no      | Structured diagnostics for signals, installs and hooks.              |
@@ -78,9 +79,10 @@
 //! `docs/API.md` in the repository.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
-// Two modules opt out locally, each with `SAFETY:` justifications: the
-// Windows console handler registration (`install/console.rs`) and a
-// read-only `sigaction` query on Unix (`install/disposition.rs`).
+// Three modules opt out locally, each with `SAFETY:` justifications: the
+// Windows console handler registration (`install/console.rs`), a
+// read-only `sigaction` query on Unix (`install/disposition.rs`), and the
+// Windows service control calls (`service/ffi.rs`, feature `service`).
 #![deny(unsafe_code)]
 // REPS requires `deny(warnings)`. It is lifted for docs.rs only, which
 // builds the published crate once with that day's nightly: a lint added

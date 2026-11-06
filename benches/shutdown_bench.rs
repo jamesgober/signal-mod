@@ -193,6 +193,72 @@ fn bench_wait_blocking_timeout_short(c: &mut Criterion) {
     });
 }
 
+fn bench_run_hooks_async_without_hooks(c: &mut Criterion) {
+    c.bench_function("run_hooks_async (no hooks)", |b| {
+        b.iter_batched(
+            || Coordinator::builder().build(),
+            |coord| {
+                black_box(smol::block_on(
+                    coord.run_hooks_async(ShutdownReason::Requested),
+                ));
+                coord
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+/// `install` + `uninstall` of the agnostic back-end, outside any
+/// runtime: on Unix a self-pipe, one `sigaction` per signal and a
+/// listener thread; on Windows a registry entry behind the console
+/// handler (registered with the OS once per process).
+#[cfg(feature = "agnostic")]
+fn bench_install_uninstall(c: &mut Criterion) {
+    let coord = Coordinator::builder()
+        .signals(SignalSet::graceful())
+        .notify_signals(SignalSet::empty().with(Signal::User1))
+        .build();
+    c.bench_function("install + uninstall (agnostic, 4 signals)", |b| {
+        b.iter(|| {
+            let _installed = black_box(coord.install());
+            black_box(coord.uninstall())
+        });
+    });
+}
+
+#[cfg(not(feature = "agnostic"))]
+fn bench_install_uninstall(_c: &mut Criterion) {}
+
+/// A real signal, from `raise` to a subscriber blocked in
+/// `recv_blocking` on this thread: the signal-hook handler, the self-pipe,
+/// the listener thread's wake-up, and the dispatch.
+#[cfg(all(unix, feature = "agnostic"))]
+fn bench_real_signal_delivery(c: &mut Criterion) {
+    let coord = Coordinator::builder()
+        .signals(SignalSet::empty())
+        .notify_signals(SignalSet::empty().with(Signal::User2))
+        .build();
+    let mut sub = coord.subscribe();
+    if coord.install().is_err() {
+        return;
+    }
+    let number = Signal::User2.unix_number().unwrap_or(libc::SIGUSR2);
+    c.bench_function("real signal: raise to recv_blocking (agnostic)", |b| {
+        b.iter(|| {
+            // SAFETY: `raise` only sends the signal to this thread; the
+            // installed handler (signal-hook's) is async-signal-safe.
+            #[allow(unsafe_code)]
+            let rc = unsafe { libc::raise(number) };
+            assert_eq!(rc, 0);
+            black_box(sub.recv_blocking())
+        });
+    });
+    let _was_installed = coord.uninstall();
+}
+
+#[cfg(not(all(unix, feature = "agnostic")))]
+fn bench_real_signal_delivery(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_token_is_initiated,
@@ -207,5 +273,8 @@ criterion_group!(
     bench_signal_set_iter,
     bench_subscription_delivery,
     bench_wait_blocking_timeout_short,
+    bench_run_hooks_async_without_hooks,
+    bench_install_uninstall,
+    bench_real_signal_delivery,
 );
 criterion_main!(benches);

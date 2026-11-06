@@ -483,8 +483,14 @@ impl Coordinator {
     /// be installed again afterwards. Dropping the coordinator does the
     /// same.
     pub fn uninstall(&self) -> bool {
-        let registration = lock(&self.installation).take();
-        match registration {
+        // Held until the listeners and the service registration are gone:
+        // an `install` racing with this call then starts after them, so
+        // it cannot run next to listeners still being removed (one signal
+        // delivered twice would count as a second signal) nor lose its
+        // own service registration to this call. Nothing below calls back
+        // into the coordinator.
+        let mut installation = lock(&self.installation);
+        match installation.take() {
             Some(registration) => {
                 registration.uninstall();
                 #[cfg(all(windows, feature = "service"))]
@@ -657,6 +663,13 @@ impl CoordinatorBuilder {
     /// re-raising fails, the process exits with the signal's
     /// [`exit_code`](Signal::exit_code) (130 for Ctrl+C). Either way
     /// destructors and remaining hooks do not run.
+    ///
+    /// On Windows only Ctrl+C and Ctrl+Break escalate. Console close,
+    /// logoff and system shutdown are sent by the OS, which ends the
+    /// process by itself after its grace period, so ending it sooner would
+    /// only cut the hooks short; and service controls (feature `service`)
+    /// never escalate, because the service control manager sends one stop
+    /// and ending the process would skip the service's `STOPPED` report.
     #[must_use]
     pub fn force_exit_on_second_signal(mut self, enabled: bool) -> Self {
         self.escalate = enabled;
@@ -849,6 +862,48 @@ mod tests {
         assert!(c.simulate_signal(Signal::User1));
         assert_eq!(sub.try_recv(), Some(Signal::User1));
         assert!(!c.token().is_initiated());
+    }
+
+    // Pre-1.0 review: `uninstall` released the installation lock before
+    // removing the listeners and the service registration, so an
+    // `install` racing with it could run next to listeners still being
+    // removed, and then lose its own service registration to the
+    // `uninstall` (stop, parameter-change and dump controls never reached
+    // the coordinator again).
+    #[cfg(all(windows, feature = "service", feature = "agnostic"))]
+    #[test]
+    fn test_racing_install_and_uninstall_leave_the_service_registration_consistent() {
+        use std::sync::Barrier;
+
+        // `User1` only: the console never delivers it (so this test does
+        // not overlap the console tests' global registry), but the service
+        // registry does.
+        let c = Arc::new(
+            Coordinator::builder()
+                .signals(SignalSet::empty())
+                .notify_signals(SignalSet::from(Signal::User1))
+                .build(),
+        );
+        for round in 0..2_000 {
+            if !c.is_installed() {
+                c.install().unwrap();
+            }
+            let barrier = Arc::new(Barrier::new(2));
+            let (c2, b2) = (Arc::clone(&c), Arc::clone(&barrier));
+            let installer = std::thread::spawn(move || {
+                let _ = b2.wait();
+                let _result = c2.install();
+            });
+            let _ = barrier.wait();
+            let _was_installed = c.uninstall();
+            installer.join().unwrap();
+            assert_eq!(
+                c.is_installed(),
+                crate::service::registry::is_registered(&c.dispatcher),
+                "round {round}: installed and registered disagree"
+            );
+        }
+        let _was_installed = c.uninstall();
     }
 
     #[cfg(not(any(feature = "tokio", feature = "agnostic")))]

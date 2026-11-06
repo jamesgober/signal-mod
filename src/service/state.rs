@@ -98,6 +98,16 @@ impl Machine {
         self.report.current_state
     }
 
+    /// The current status, to report again; `None` once stopped (after
+    /// `STOPPED` the service must not report anything else).
+    pub(crate) const fn reannounce(&self) -> Option<Report> {
+        if self.report.current_state == SERVICE_STOPPED {
+            None
+        } else {
+            Some(self.report())
+        }
+    }
+
     /// Still starting; the SCM waits `wait_hint` for the next report.
     pub(crate) fn starting(&mut self, wait_hint: Duration) -> Option<Report> {
         if self.report.current_state != SERVICE_START_PENDING {

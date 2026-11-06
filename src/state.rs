@@ -58,7 +58,15 @@ fn take_cancellations(_shared: &mut Shared) -> Cancellations {}
 #[cfg(feature = "tokio-util")]
 fn cancel_all(tokens: Cancellations) {
     for token in tokens {
-        token.cancel();
+        // `cancel` wakes the tasks waiting on the token; a panicking
+        // waker must not keep the other tokens and the child scopes from
+        // being cancelled (see `wake_all`).
+        let cancelled =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || token.cancel()));
+        if let Err(payload) = cancelled {
+            sm_error!("cancelling a linked CancellationToken panicked");
+            sync::drop_payload(payload);
+        }
     }
 }
 #[cfg(not(feature = "tokio-util"))]

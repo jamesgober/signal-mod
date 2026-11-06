@@ -89,9 +89,18 @@ impl WaitList {
 /// Wake every waker in `wakers`. Called after the owner's lock is
 /// released so that a waker that synchronously polls (some executors
 /// do) cannot deadlock on it.
+///
+/// A waker belongs to the caller's executor. One that panics must not
+/// keep the tasks after it from being woken, nor unwind into the code
+/// that woke it (a shutdown trigger, a signal listener), so its panic is
+/// contained here and the remaining wakers are still woken.
 pub(crate) fn wake_all(wakers: Vec<Waker>) {
     for waker in wakers {
-        waker.wake();
+        let woken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || waker.wake()));
+        if let Err(payload) = woken {
+            sm_error!("a task waker panicked; the other tasks are still woken");
+            crate::sync::drop_payload(payload);
+        }
     }
 }
 

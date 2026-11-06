@@ -6,6 +6,83 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-11-04
+
+Pre-1.0 review of the whole crate (security, edge cases, idle cost). No
+public API change; MSRV unchanged (1.85); no new dependency.
+
+### Fixed
+
+- A hook panic whose payload panics again when dropped killed the hook
+  worker thread with the hook still `Running`: the run then waited for
+  the hook's deadline (and reported it `TimedOut`), or forever without
+  one. The payload is now leaked instead (the message of the panic its
+  destructor raised is freed), and the hook is reported `Panicked`.
+- A task waker that panicked while shutdown was triggered (or a signal
+  delivered) unwound out of `trigger`: the tasks after it were never
+  woken, child scopes and linked `CancellationToken`s were never
+  cancelled, and the signal listener thread or task that was delivering
+  died (on Unix every later signal was then lost; the Windows console
+  handler already caught it). Waker, cancellation and delivery panics
+  are now contained; every other task is still woken and the listener
+  goes on.
+- Windows service (feature `service`): status reports were made under
+  the status lock but sent after releasing it, so the service's thread
+  and the control handler could send them out of order (a checkpoint
+  going backwards, a `STOP_PENDING` or interrogate answer arriving after
+  `STOPPED`). Reports are now sent in the order they are made, and
+  nothing is sent after `STOPPED`.
+- Windows service: a stop control that found shutdown already initiated
+  went through `force_exit_on_second_signal` and ended the process
+  without the `STOPPED` report, so the service control manager recorded
+  a failure and ran the service's recovery actions. Service controls no
+  longer escalate.
+- Windows: with `force_exit_on_second_signal`, console close, logoff and
+  system shutdown counted as a second signal. A service gets both
+  `SERVICE_CONTROL_SHUTDOWN` (`Terminate`) and `CTRL_SHUTDOWN_EVENT`
+  (`Hangup`, in the default `graceful()` set) for one machine shutdown,
+  so the second ended the process before its hooks ran; closing the
+  console after Ctrl+C did the same. These events come from the OS, which
+  ends the process itself after its grace period: on Windows only Ctrl+C
+  and Ctrl+Break escalate now (also through `simulate_signal`).
+- `Coordinator::uninstall` released its lock before removing the
+  listeners, so an `install` racing with it could run next to listeners
+  still being removed (one signal delivered twice counts as a second
+  signal) and, on Windows with `service`, lose its service registration
+  to the `uninstall`. The lock is now held until the listeners are gone.
+
+### Changed
+
+- `run_hooks_async` on a coordinator without hooks resolves on its first
+  poll instead of starting a supervisor thread: about 64 us to 160 ns on
+  Windows.
+
+### Documentation
+
+- `docs/API.md`: a "Known limitations" section restating each recorded
+  limitation with its reason (they were only in the 2.0.0 release
+  notes), the panic containment, the service escalation and ordering
+  rules, and the `service` section in the table of contents.
+- `REPS.md`: the `service` module in the safety contract and the
+  dependency table, the idle cost, and the scope note that service
+  control is in the crate since 2.1.0. The crate-root lint comment and
+  feature table name the `service` module.
+
+### Tests and benchmarks
+
+- Regression tests for each fix above, and `tests/idle.rs`: an installed
+  coordinator's threads see no context switch while idle (Linux).
+- Benchmarks for `install` + `uninstall`, `run_hooks_async` without
+  hooks, and real-signal delivery on Unix (raise to `recv_blocking`).
+
+### Lockfile
+
+- async-executor 1.14.1 (1.14.0 was yanked; development only, under
+  `smol`).
+- `deny.toml` ignores RUSTSEC-2026-0441 (`pin-utils` unmaintained, no
+  fixed version), which reaches the tree only through the development
+  dependency `loom`.
+
 ## [2.1.0] - 2026-10-28
 
 Additive: Windows service control. No breaking change; MSRV unchanged
@@ -452,7 +529,9 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/signal-mod/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/signal-mod/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/jamesgober/signal-mod/compare/v2.1.0...v2.1.1
+[2.1.0]: https://github.com/jamesgober/signal-mod/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/jamesgober/signal-mod/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/jamesgober/signal-mod/compare/v0.9.1...v1.0.0
 [0.9.1]: https://github.com/jamesgober/signal-mod/releases/tag/v0.9.1

@@ -232,6 +232,45 @@ fn test_panicking_hook_is_reported_with_message_and_not_counted_completed() {
     assert_eq!(coord.run_hooks(ShutdownReason::Requested), 1);
 }
 
+/// A panic payload whose destructor panics as well.
+struct LoudPayload;
+
+impl Drop for LoudPayload {
+    fn drop(&mut self) {
+        panic!("payload destructor");
+    }
+}
+
+// Pre-1.0 review: a panic payload that panics when dropped killed the
+// hook worker thread. With unbounded budgets the run never ended; with
+// bounded ones the hook was reported `TimedOut` at its deadline and the
+// hooks after it lost the graceful phase.
+#[test]
+fn test_panic_payload_that_panics_on_drop_is_reported_and_run_continues() {
+    let after = Arc::new(AtomicUsize::new(0));
+    let coord = Coordinator::builder()
+        .graceful_timeout(Duration::MAX)
+        .force_timeout(Duration::MAX)
+        .hook(hook_from_fn("loud", 100, |_| {
+            std::panic::panic_any(LoudPayload)
+        }))
+        .hook(counter_hook("after", 0, &after))
+        .build();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let run = thread::spawn(move || {
+        let report = coord.run_hooks_with_report(ShutdownReason::Requested);
+        let _sent = tx.send(report);
+    });
+    let report = rx
+        .recv_timeout(WELL_BEFORE_HANG)
+        .expect("the run must end although the payload's destructor panics");
+    run.join().unwrap();
+    assert_eq!(report.panicked(), 1);
+    assert_eq!(report.completed(), 1);
+    assert_eq!(report.outcomes()[1].phase, Some(HookPhase::Graceful));
+    assert_eq!(after.load(Ordering::SeqCst), 1);
+}
+
 // SM-007: 1.0.0 re-ran every hook on every call.
 #[test]
 fn test_second_call_returns_same_report_without_rerunning_hooks() {
@@ -384,6 +423,28 @@ fn test_run_hooks_with_no_hooks_returns_empty_clean_report() {
     assert!(report.is_clean());
     assert_eq!(report.outcomes().len(), 0);
     assert_eq!(coord.run_hooks(ShutdownReason::Requested), 0);
+}
+
+// Pre-1.0 tuning: without hooks there is nothing to supervise, so the
+// async run resolves on its first poll instead of spawning a supervisor
+// thread (about 60 us), and later callers get the same report.
+#[test]
+fn test_async_run_without_hooks_resolves_on_first_poll() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let coord = Coordinator::builder().build();
+    let mut run = coord.run_hooks_async(ShutdownReason::Timeout);
+    let mut cx = Context::from_waker(Waker::noop());
+    let Poll::Ready(report) = std::pin::Pin::new(&mut run).poll(&mut cx) else {
+        panic!("an empty run must resolve on its first poll");
+    };
+    assert!(report.is_clean());
+    assert_eq!(report.reason(), ShutdownReason::Timeout);
+    assert_eq!(
+        coord.run_hooks_with_report(ShutdownReason::Requested),
+        report
+    );
 }
 
 // SM-003 / audit P13: in 1.0.0 the documented `Handle::block_on` bridge
