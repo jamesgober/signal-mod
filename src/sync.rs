@@ -96,11 +96,19 @@ pub(crate) fn wait_timeout<'a, T>(
 /// code that just caught the first panic: a hook worker would die with
 /// its slot still `Running` (the run then waited for the hook's deadline,
 /// or forever without one), and a signal listener would stop delivering.
-/// A payload whose destructor panics is leaked instead, and so is the
-/// second payload, so this cannot recurse.
+/// A payload whose destructor panics is leaked instead. The second
+/// payload is freed when it is the `&'static str` or `String` that
+/// `panic!` makes (their destructors cannot panic) and leaked otherwise,
+/// so this cannot recurse.
 pub(crate) fn drop_payload(payload: Box<dyn core::any::Any + Send>) {
     let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(payload)));
     if let Err(nested) = dropped {
-        core::mem::forget(nested);
+        match nested.downcast::<&'static str>() {
+            Ok(text) => drop(text),
+            Err(nested) => match nested.downcast::<std::string::String>() {
+                Ok(text) => drop(text),
+                Err(other) => core::mem::forget(other),
+            },
+        }
     }
 }

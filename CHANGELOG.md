@@ -16,8 +16,8 @@ public API change; MSRV unchanged (1.85); no new dependency.
 - A hook panic whose payload panics again when dropped killed the hook
   worker thread with the hook still `Running`: the run then waited for
   the hook's deadline (and reported it `TimedOut`), or forever without
-  one. The payload is now leaked instead, and the hook is reported
-  `Panicked`.
+  one. The payload is now leaked instead (the message of the panic its
+  destructor raised is freed), and the hook is reported `Panicked`.
 - A task waker that panicked while shutdown was triggered (or a signal
   delivered) unwound out of `trigger`: the tasks after it were never
   woken, child scopes and linked `CancellationToken`s were never
