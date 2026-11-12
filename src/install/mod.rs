@@ -128,7 +128,12 @@ pub(crate) fn install(
             sm_info!(signals = ?skipped,
                 "default shutdown signals that were ignored before install stay ignored");
         }
-        set - skipped
+        let set = set - skipped;
+        // Before the back-end's handlers, so one delivery reads the
+        // restore flag before it wakes anyone (see `restore`).
+        restore::prepare(set, dispatcher.shutdown_set())
+            .map_err(|(sig, e)| registration_error(sig, e))?;
+        set
     };
     #[cfg(not(all(unix, any(feature = "tokio", feature = "agnostic"))))]
     let _ = skip_if_ignored; // nothing is ignored on this platform

@@ -27,14 +27,24 @@
 //! the default action (terminate, or core dump for SIGQUIT), as if no
 //! handler had ever been installed.
 //!
-//! Installing is two steps around the back-end's own registration:
-//! [`observe`] before it (the disposition must be read before anything
-//! replaces it), [`arm`] after it. Arming last means a signal arriving
-//! during `install` is never lost: before the delivering handler exists
-//! the signal still has its prior action (on a first install, the
-//! default), and from then on it is delivered. (Up to 2.1.1 the
-//! conditional default was registered, switched off, first, and a signal
-//! landing before the delivering handler ran neither.)
+//! Installing is three steps around the back-end's own registration:
+//! [`observe`] (the disposition must be read before anything replaces
+//! it) and [`prepare`] before it, [`arm`] after it.
+//!
+//! - [`prepare`] registers the conditional default with its flag **on**,
+//!   so until the coordinator is armed a signal still gets its prior
+//!   action, the default: nothing is lost during `install`. (Up to 2.1.1
+//!   the action was registered switched off, and a signal landing before
+//!   the delivering handler ran neither.)
+//! - Registering it **before** the delivering handler fixes the order in
+//!   which one delivery runs them: signal-hook runs a signal's actions in
+//!   the order they were registered, so the flag is read before the
+//!   delivering handler wakes anyone. In 2.2.0 it was registered after,
+//!   and a process that stopped fast on the signal (its uninstall turning
+//!   the flag on) could do so while the same delivery was still between
+//!   the two actions: the default action then ran too, and the process
+//!   was killed by the signal it was shutting down for.
+//! - [`arm`] switches the flag off once the delivering handler exists.
 //!
 //! The table is process-global because signal dispositions are; that is
 //! the documented, unavoidable exception to the no-global-state rule.
@@ -110,13 +120,52 @@ pub(crate) fn observe(all: SignalSet) -> SignalSet {
     ignored
 }
 
+/// The signals of `shutdown` (within `all`) whose default action is
+/// restored after the last uninstall.
+fn eligible(all: SignalSet, shutdown: SignalSet) -> SignalSet {
+    (shutdown & all).without(Signal::Pipe)
+}
+
+/// Register the conditional default action of every eligible signal of
+/// `shutdown` that has none yet, with its flag **on**: until [`arm`]
+/// turns it off, the signal keeps its default action.
+///
+/// Must run **before** the back-end registers its delivering handlers
+/// (see the module documentation).
+///
+/// # Errors
+///
+/// [`io::Error`] (with the failing signal) if a conditional default
+/// action cannot be registered.
+pub(crate) fn prepare(all: SignalSet, shutdown: SignalSet) -> Result<(), (Signal, io::Error)> {
+    #[cfg(test)]
+    super::test_step("prepare");
+    let mut table = table();
+    for sig in eligible(all, shutdown) {
+        let (Some(i), Some(number)) = (index(sig), sig.unix_number()) else {
+            continue;
+        };
+        let Some(slot) = table.get_mut(i).and_then(Option::as_mut) else {
+            continue;
+        };
+        if !slot.was_default || slot.restore_default.is_some() {
+            continue;
+        }
+        let flag = Arc::new(AtomicBool::new(true));
+        match signal_hook::flag::register_conditional_default(number, Arc::clone(&flag)) {
+            Ok(_id) => slot.restore_default = Some(flag),
+            Err(error) => return Err((sig, error)),
+        }
+    }
+    Ok(())
+}
+
 /// Count every eligible signal of `shutdown` (within `all`, which
-/// [`observe`] saw) as installed, registering its conditional default
-/// action the first time.
+/// [`observe`] saw) as installed, switching its conditional default off.
 ///
 /// Must run **after** the back-end registered its delivering handlers
-/// (see the module documentation). Returns the signals that were
-/// counted; pass exactly that set to [`release`].
+/// (see the module documentation), and after [`prepare`]. Returns the
+/// signals that were counted; pass exactly that set to [`release`].
 ///
 /// # Errors
 ///
@@ -128,7 +177,7 @@ pub(crate) fn arm(all: SignalSet, shutdown: SignalSet) -> Result<SignalSet, (Sig
     super::test_step("arm");
     let mut table = table();
     let mut counted = SignalSet::empty();
-    for sig in (shutdown & all).without(Signal::Pipe) {
+    for sig in eligible(all, shutdown) {
         let (Some(i), Some(number)) = (index(sig), sig.unix_number()) else {
             continue;
         };
@@ -139,6 +188,8 @@ pub(crate) fn arm(all: SignalSet, shutdown: SignalSet) -> Result<SignalSet, (Sig
             continue;
         }
         if slot.restore_default.is_none() {
+            // Only when `prepare` did not run for this signal; registered
+            // off, as before 2.2.1.
             let flag = Arc::new(AtomicBool::new(false));
             match signal_hook::flag::register_conditional_default(number, Arc::clone(&flag)) {
                 Ok(_id) => slot.restore_default = Some(flag),
