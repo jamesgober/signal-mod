@@ -6,6 +6,27 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-11-12
+
+A fix for a race 2.2.0 brought in. No API change; MSRV unchanged (1.85).
+
+### Fixed
+
+- Unix: a process could be killed by the shutdown signal it was
+  stopping for. 2.2.0 registered the action that restores a signal's
+  default (after the last coordinator uninstalls) after the delivering
+  handler; signal-hook runs a signal's actions in the order they were
+  registered, so one delivery woke the coordinator first and read the
+  restore flag second. A process that stopped fast enough on SIGTERM
+  (uninstalling its coordinator, which turns the flag on) could do so
+  in between, and the same delivery then ran SIGTERM's default action:
+  the process died by SIGTERM in the middle of its shutdown hooks. The
+  restore action is registered first again, switched on until the
+  coordinator is armed, so a signal before that still gets its default
+  action and none is lost during `install`. Seen as an intermittent
+  death by SIGTERM (about 1 run in 15 on a loaded Linux machine) in a
+  consumer's SIGHUP-then-SIGTERM test; 0 in 40 with the fix.
+
 ## [2.2.0] - 2026-11-11
 
 Fixes from an independent review. No breaking API change; MSRV
@@ -592,7 +613,8 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/signal-mod/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/signal-mod/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/jamesgober/signal-mod/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/jamesgober/signal-mod/compare/v2.1.1...v2.2.0
 [2.1.1]: https://github.com/jamesgober/signal-mod/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/jamesgober/signal-mod/compare/v2.0.0...v2.1.0

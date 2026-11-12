@@ -251,6 +251,10 @@ mod unix_tests {
     // between ran only the switched-off action and was lost. The
     // delivering handler must come first.
     #[test]
+    // Since 2.2.1 the conditional default is registered first (switched
+    // on, so nothing is lost before the delivering handler exists): one
+    // delivery runs it before the delivering handler, so a coordinator
+    // uninstalled fast on that signal cannot have it end the process.
     fn test_delivering_handler_is_registered_before_restoration_is_armed() {
         let inner = Inner::new();
         let set = SignalSet::from(Signal::User2);
@@ -264,7 +268,7 @@ mod unix_tests {
             .unwrap_or_else(|e| panic!("install failed: {e}"));
         let steps = super::super::TEST_STEPS.with(|steps| steps.borrow().clone());
         reg.uninstall();
-        assert_eq!(steps, vec!["register", "arm"]);
+        assert_eq!(steps, vec!["prepare", "register", "arm"]);
     }
 }
 
