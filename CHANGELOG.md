@@ -383,7 +383,7 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   "hooks have at most this long", "at most once", "consistent
   snapshot", `&SignalSet: IntoIterator`, the `Handle::block_on` bridge,
   "do not install from two coordinators", Windows event coverage,
-  "early scaffolding", examples coverage, `.dev/DESIGN.md` references
+  "early scaffolding", examples coverage, design-note references
   (D1 to D29; D18 and D26 corrected in REPS.md and below).
 - Vacuous tests (`ran <= 2`, an empty install test) replaced with real
   assertions (SM-020).
@@ -589,7 +589,7 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   0.x line: `Signal`, `SignalSet`, `ShutdownReason`, `ShutdownToken`,
   `ShutdownTrigger`, `ShutdownHook`, `Coordinator`,
   `CoordinatorBuilder`, `Statistics`, `Error`, `Result`.
-- `.dev/DESIGN.md` documenting design trade-offs: substrate vs
+- A design note documenting the trade-offs: substrate vs
   framework split with `proc-daemon`, two-handle observer/initiator
   capability separation, sync hook trait, `parking_lot` choice,
   optional runtime features, sorted-vec hook ordering, install
@@ -609,8 +609,7 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
 ### Added
 
 - Initial repository scaffold.
-- Apache-2.0 license, README, REPS specification stub, CI workflow,
-  `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
+- Apache-2.0 license, README, REPS specification stub, CI workflow.
 - Crate name reserved on crates.io.
 
 [Unreleased]: https://github.com/jamesgober/signal-mod/compare/v2.2.1...HEAD
