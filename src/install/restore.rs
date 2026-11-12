@@ -27,6 +27,15 @@
 //! the default action (terminate, or core dump for SIGQUIT), as if no
 //! handler had ever been installed.
 //!
+//! Installing is two steps around the back-end's own registration:
+//! [`observe`] before it (the disposition must be read before anything
+//! replaces it), [`arm`] after it. Arming last means a signal arriving
+//! during `install` is never lost: before the delivering handler exists
+//! the signal still has its prior action (on a first install, the
+//! default), and from then on it is delivered. (Up to 2.1.1 the
+//! conditional default was registered, switched off, first, and a signal
+//! landing before the delivering handler ran neither.)
+//!
 //! The table is process-global because signal dispositions are; that is
 //! the documented, unavoidable exception to the no-global-state rule.
 
@@ -40,6 +49,8 @@ use crate::signal::{Signal, SignalSet};
 struct Slot {
     /// Disposition was `SIG_DFL` when signal-mod first saw the signal.
     was_default: bool,
+    /// Disposition was `SIG_IGN` when signal-mod first saw the signal.
+    was_ignored: bool,
     /// The conditional default action, once registered.
     restore_default: Option<Arc<AtomicBool>>,
     /// Installed coordinators using the signal as a shutdown signal.
@@ -60,45 +71,62 @@ fn index(sig: Signal) -> Option<usize> {
 }
 
 /// Record the prior disposition of every signal in `all` not seen
-/// before, then count every eligible signal of `shutdown` as installed.
+/// before. Returns the signals of `all` that were ignored (`SIG_IGN`)
+/// when signal-mod first saw them.
 ///
 /// Must run before the back-end registers anything for these signals.
-/// Returns the signals that were counted; pass exactly that set to
-/// [`release`].
+pub(crate) fn observe(all: SignalSet) -> SignalSet {
+    use super::disposition::{Disposition, disposition};
+
+    let mut table = table();
+    let mut ignored = SignalSet::empty();
+    for sig in all.without(Signal::Pipe) {
+        let (Some(i), Some(number)) = (index(sig), sig.unix_number()) else {
+            continue;
+        };
+        let Some(entry) = table.get_mut(i) else {
+            continue;
+        };
+        if entry.is_none() {
+            let prior = match disposition(number) {
+                Ok(prior) => prior,
+                Err(error) => {
+                    sm_warn!(signal = %sig, error = %error,
+                        "could not read the signal disposition; it will not be restored");
+                    drop(error);
+                    Disposition::Handled
+                }
+            };
+            *entry = Some(Slot {
+                was_default: prior == Disposition::Default,
+                was_ignored: prior == Disposition::Ignored,
+                ..Slot::default()
+            });
+        }
+        if entry.as_ref().is_some_and(|slot| slot.was_ignored) {
+            ignored = ignored.with(sig);
+        }
+    }
+    ignored
+}
+
+/// Count every eligible signal of `shutdown` (within `all`, which
+/// [`observe`] saw) as installed, registering its conditional default
+/// action the first time.
+///
+/// Must run **after** the back-end registered its delivering handlers
+/// (see the module documentation). Returns the signals that were
+/// counted; pass exactly that set to [`release`].
 ///
 /// # Errors
 ///
 /// [`io::Error`] (with the failing signal) if a conditional default
 /// action cannot be registered. Signals counted before the failure are
 /// released again.
-pub(crate) fn acquire(
-    all: SignalSet,
-    shutdown: SignalSet,
-) -> Result<SignalSet, (Signal, io::Error)> {
+pub(crate) fn arm(all: SignalSet, shutdown: SignalSet) -> Result<SignalSet, (Signal, io::Error)> {
+    #[cfg(test)]
+    super::test_step("arm");
     let mut table = table();
-    for sig in all.without(Signal::Pipe) {
-        let (Some(i), Some(number)) = (index(sig), sig.unix_number()) else {
-            continue;
-        };
-        if let Some(entry) = table.get_mut(i) {
-            if entry.is_none() {
-                let was_default = match super::disposition::is_default(number) {
-                    Ok(default) => default,
-                    Err(error) => {
-                        sm_warn!(signal = %sig, error = %error,
-                            "could not read the signal disposition; it will not be restored");
-                        drop(error);
-                        false
-                    }
-                };
-                *entry = Some(Slot {
-                    was_default,
-                    ..Slot::default()
-                });
-            }
-        }
-    }
-
     let mut counted = SignalSet::empty();
     for sig in (shutdown & all).without(Signal::Pipe) {
         let (Some(i), Some(number)) = (index(sig), sig.unix_number()) else {
@@ -168,8 +196,9 @@ mod tests {
         // USR2 is at its default action in the test process.
         let all = SignalSet::from(Signal::User2) | Signal::Pipe | Signal::User1;
         let shutdown = SignalSet::from(Signal::User2) | Signal::Pipe;
-        let first = acquire(all, shutdown).unwrap_or_else(|(s, e)| panic!("{s}: {e}"));
-        let second = acquire(all, shutdown).unwrap_or_else(|(s, e)| panic!("{s}: {e}"));
+        let _ignored = observe(all);
+        let first = arm(all, shutdown).unwrap_or_else(|(s, e)| panic!("{s}: {e}"));
+        let second = arm(all, shutdown).unwrap_or_else(|(s, e)| panic!("{s}: {e}"));
         assert_eq!(first, SignalSet::from(Signal::User2));
         assert_eq!(second, first);
         assert_eq!(installs(Signal::User2), 2);
@@ -181,5 +210,13 @@ mod tests {
         assert_eq!(installs(Signal::User2), 0);
         release(second); // saturates
         assert_eq!(installs(Signal::User2), 0);
+    }
+
+    #[test]
+    fn test_observe_reports_signals_ignored_when_first_seen() {
+        // SIGPIPE is ignored by the Rust runtime but never tracked; USR2
+        // is at its default action.
+        let all = SignalSet::from(Signal::User2) | Signal::Pipe;
+        assert_eq!(observe(all), SignalSet::empty());
     }
 }

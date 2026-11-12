@@ -70,10 +70,11 @@
 //!
 //! Signal numbers come from the target's `libc` (SIGUSR1 is 10 on Linux,
 //! 30 on macOS and the BSDs). On Windows, `Terminate` is
-//! `CTRL_CLOSE_EVENT` (the OS kills the process about 5 seconds later),
-//! `Quit` is `CTRL_BREAK_EVENT`, and `Hangup` covers `CTRL_LOGOFF_EVENT`
-//! and `CTRL_SHUTDOWN_EVENT` (delivered to services only); see
-//! [`Signal`].
+//! `CTRL_CLOSE_EVENT` (the OS kills the process about 5 seconds later)
+//! and `CTRL_SHUTDOWN_EVENT` (services only), `Quit` is
+//! `CTRL_BREAK_EVENT`, `Hangup` is never delivered, and
+//! `CTRL_LOGOFF_EVENT` is declined, so a service keeps running when a
+//! user logs off; see [`Signal`].
 //!
 //! The design contract lives in `REPS.md` and the full guide in
 //! `docs/API.md` in the repository.

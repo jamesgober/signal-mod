@@ -12,10 +12,10 @@ use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Sub, SubAssign};
 ///
 /// | Variant      | Unix     | Windows                                      |
 /// | ------------ | -------- | -------------------------------------------- |
-/// | `Terminate`  | SIGTERM  | `CTRL_CLOSE_EVENT`                           |
+/// | `Terminate`  | SIGTERM  | `CTRL_CLOSE_EVENT`, `CTRL_SHUTDOWN_EVENT`    |
 /// | `Interrupt`  | SIGINT   | `CTRL_C_EVENT`                               |
 /// | `Quit`       | SIGQUIT  | `CTRL_BREAK_EVENT`                           |
-/// | `Hangup`     | SIGHUP   | `CTRL_LOGOFF_EVENT`, `CTRL_SHUTDOWN_EVENT`   |
+/// | `Hangup`     | SIGHUP   | never delivered                              |
 /// | `Pipe`       | SIGPIPE  | never delivered                              |
 /// | `User1`      | SIGUSR1  | service control code 128 (feature `service`) |
 /// | `User2`      | SIGUSR2  | `SERVICE_CONTROL_PARAMCHANGE` (`service`)    |
@@ -25,6 +25,13 @@ use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Sub, SubAssign};
 /// - `CTRL_LOGOFF_EVENT` and `CTRL_SHUTDOWN_EVENT` reach services
 ///   only. An interactive console program is terminated at logoff or
 ///   shutdown without seeing either event.
+/// - `CTRL_LOGOFF_EVENT` is sent to a service when **any** user logs
+///   off, and the OS does not end the service. signal-mod declines it
+///   (since 2.2.0), so the default handling applies and the service
+///   keeps running. Before 2.2.0 it was delivered as `Hangup`, which
+///   stopped (or reloaded) a service at every user logoff.
+/// - `CTRL_SHUTDOWN_EVENT` (machine shutdown) is delivered as
+///   `Terminate` since 2.2.0; it was `Hangup` before.
 /// - After `CTRL_CLOSE_EVENT` (console window closed) the operating
 ///   system terminates the process about five seconds later, whatever
 ///   the program is doing. Keep the hook budget below that when console
@@ -50,14 +57,15 @@ pub enum Signal {
     Interrupt,
     /// SIGQUIT (Ctrl+\\) on Unix, `CTRL_BREAK_EVENT` on Windows.
     Quit,
-    /// SIGHUP on Unix; `CTRL_LOGOFF_EVENT` and `CTRL_SHUTDOWN_EVENT`
-    /// on Windows.
+    /// SIGHUP on Unix. Never delivered on Windows (since 2.2.0; see the
+    /// table above).
     ///
     /// Daemons conventionally treat SIGHUP as "reload configuration"
     /// rather than "stop". [`SignalSet::graceful`] includes it as a
-    /// shutdown signal; to use it for reload instead, remove it from
-    /// the shutdown set and add it to
-    /// [`CoordinatorBuilder::notify_signals`](crate::CoordinatorBuilder::notify_signals).
+    /// shutdown signal. To use it for reload instead, add it to
+    /// [`CoordinatorBuilder::notify_signals`](crate::CoordinatorBuilder::notify_signals):
+    /// that takes it out of the default shutdown set. With an explicit
+    /// shutdown set, leave it out of that set ([`SignalSet::stop`]).
     Hangup,
     /// SIGPIPE (Unix only; never delivered on Windows).
     ///
@@ -104,7 +112,7 @@ impl Signal {
             Self::Terminate => "Terminate (SIGTERM / CTRL_CLOSE_EVENT)",
             Self::Interrupt => "Interrupt (SIGINT / CTRL_C_EVENT)",
             Self::Quit => "Quit (SIGQUIT / CTRL_BREAK_EVENT)",
-            Self::Hangup => "Hangup (SIGHUP / CTRL_LOGOFF_EVENT / CTRL_SHUTDOWN_EVENT)",
+            Self::Hangup => "Hangup (SIGHUP)",
             Self::Pipe => "Pipe (SIGPIPE, Unix only)",
             Self::User1 => "User1 (SIGUSR1, Unix only)",
             Self::User2 => "User2 (SIGUSR2, Unix only)",
@@ -273,8 +281,8 @@ impl fmt::Display for Signal {
 /// `SignalSet` is `Copy` and const-constructible, and supports the set
 /// operators `|` (union), `&` (intersection) and `-` (difference), with
 /// either another set or a single [`Signal`] on the right. The usual
-/// constructors are [`SignalSet::graceful`] (also the `Default`) and
-/// [`SignalSet::standard`].
+/// constructors are [`SignalSet::graceful`] (also the `Default`),
+/// [`SignalSet::stop`] (no SIGHUP) and [`SignalSet::standard`].
 ///
 /// # Examples
 ///
@@ -316,13 +324,57 @@ impl SignalSet {
         }
     }
 
-    /// The recommended default: `Terminate | Interrupt | Hangup`.
+    /// The default shutdown set: `Terminate | Interrupt | Hangup`.
+    ///
+    /// [`CoordinatorBuilder::new`](crate::CoordinatorBuilder::new) and
+    /// [`shutdown_signal`](crate::shutdown_signal) use it when no set is
+    /// given, with two adjustments for SIGHUP, which daemons
+    /// conventionally treat as "reload" rather than "stop":
+    ///
+    /// - a signal given to
+    ///   [`notify_signals`](crate::CoordinatorBuilder::notify_signals)
+    ///   is taken out of the default set, so a reload subscription to
+    ///   `Hangup` does not also stop the process;
+    /// - on Unix, a signal of the default set that was ignored
+    ///   (`SIG_IGN`) before signal-mod first installed it, as SIGHUP is
+    ///   under `nohup`, is left ignored.
+    ///
+    /// Neither adjustment applies to a set passed explicitly to
+    /// [`signals`](crate::CoordinatorBuilder::signals). For a service
+    /// that should never stop on SIGHUP, use [`SignalSet::stop`].
     #[must_use]
     pub const fn graceful() -> Self {
         Self::empty()
             .with(Signal::Terminate)
             .with(Signal::Interrupt)
             .with(Signal::Hangup)
+    }
+
+    /// The stop requests only: `Terminate | Interrupt`.
+    ///
+    /// Unlike [`SignalSet::graceful`] it leaves SIGHUP alone, so the
+    /// process keeps running when its terminal hangs up (`nohup`) and
+    /// SIGHUP stays free for "reload" through
+    /// [`notify_signals`](crate::CoordinatorBuilder::notify_signals).
+    /// The usual choice for daemons and services.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use signal_mod::{Coordinator, Signal, SignalSet};
+    ///
+    /// let coord = Coordinator::builder()
+    ///     .signals(SignalSet::stop())
+    ///     .notify_signals(SignalSet::from(Signal::Hangup))
+    ///     .build();
+    /// assert!(coord.signals().contains(Signal::Terminate));
+    /// assert!(!coord.signals().contains(Signal::Hangup));
+    /// ```
+    #[must_use]
+    pub const fn stop() -> Self {
+        Self::empty()
+            .with(Signal::Terminate)
+            .with(Signal::Interrupt)
     }
 
     /// Maximum graceful coverage: `Terminate | Interrupt | Quit | Hangup`.

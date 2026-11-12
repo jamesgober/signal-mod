@@ -10,9 +10,15 @@ use crate::error::Result;
 use crate::reason::ShutdownReason;
 use crate::token::{ShutdownFuture, ShutdownToken};
 
-/// Install handlers for [`SignalSet::graceful`](crate::SignalSet::graceful)
-/// (SIGTERM, SIGINT, SIGHUP / Ctrl+C, console close) and return a future
+/// Install handlers for the default shutdown set,
+/// [`SignalSet::graceful`](crate::SignalSet::graceful) (SIGTERM, SIGINT,
+/// SIGHUP / Ctrl+C, console close, system shutdown), and return a future
 /// that resolves when one arrives.
+///
+/// On Unix, a signal of that set that was ignored before the call stays
+/// ignored: under `nohup`, SIGHUP does not resolve the future. For a set
+/// without SIGHUP whatever the start-up state, build a [`Coordinator`]
+/// with [`SignalSet::stop`](crate::SignalSet::stop).
 ///
 /// Made for `with_graceful_shutdown`-style APIs (axum, hyper, tonic,
 /// warp), which take a `Future<Output = ()> + Send + 'static`. The
@@ -36,7 +42,7 @@ use crate::token::{ShutdownFuture, ShutdownToken};
 /// let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
 /// let app = axum::Router::new();
 /// axum::serve(listener, app)
-///     .with_graceful_shutdown(signal_mod::shutdown_signal().map_err(std::io::Error::other)?)
+///     .with_graceful_shutdown(signal_mod::shutdown_signal()?)
 ///     .await
 /// # }
 /// ```

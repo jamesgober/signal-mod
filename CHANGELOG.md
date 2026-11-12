@@ -6,6 +6,69 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-11
+
+Fixes from an independent review. No breaking API change; MSRV
+unchanged (1.85); no new dependency.
+
+### Added
+
+- `SignalSet::stop()`: `Terminate | Interrupt`, the default set without
+  SIGHUP, for daemons and services that reload on SIGHUP or run under
+  `nohup`.
+- `impl From<signal_mod::Error> for std::io::Error`, so `install()?` and
+  `shutdown_signal()?` work in `io::Result` functions. The kind follows
+  the OS error (`AlreadyExists` for `AlreadyInstalled`, `Unsupported`
+  for `NoRuntime` and `OutsideTokioRuntime`), and the signal-mod error
+  stays the inner error.
+
+### Fixed
+
+- A reload subscription on the default builder
+  (`Coordinator::builder().notify_signals(SignalSet::from(Signal::Hangup))`)
+  left `Hangup` in the default shutdown set, so the first reload request
+  (`systemctl reload`, `kill -HUP`) stopped the process. A signal given
+  to `notify_signals` now leaves the default shutdown set. A shutdown
+  set passed explicitly to `signals` is still used as given; an overlap
+  with the notify set is logged at warn level (feature `tracing`).
+- Unix: the default shutdown set caught signals that were ignored
+  (`SIG_IGN`) before install, so a process started under `nohup` with
+  `shutdown_signal()` or the default builder shut down when its terminal
+  hung up. Signals of the default set that were ignored when signal-mod
+  first saw them are now left ignored, and `installed_signals()` leaves
+  them out. An explicit `signals` set is installed as given.
+- Windows: `CTRL_LOGOFF_EVENT` was delivered as `Hangup`, which is in the
+  default set. Services receive it whenever any user logs off, and the
+  OS does not end a service for it, so a service stopped (or, with a
+  reload subscription, reloaded) at every user logoff. Without the
+  `tokio` feature each logoff also left one OS handler thread parked for
+  the life of the process. The event is now declined at once, so the
+  default handling applies and the service keeps running.
+- Windows: `CTRL_SHUTDOWN_EVENT` (machine shutdown) is now `Terminate`
+  instead of `Hangup`, so a service that reloads on `Hangup` shuts down
+  gracefully at machine shutdown. `Hangup` is no longer delivered on
+  Windows.
+- `force_exit_on_second_signal`: on Unix any second shutdown signal
+  escalated, so the SIGTERM then SIGHUP pair systemd sends with
+  `SendSIGHUP=yes` killed the process before its hooks ran. Only a repeat
+  escalates now: the signal that initiated the shutdown again, or Ctrl+C
+  and `Quit` after each other. After a shutdown started by a
+  `ShutdownTrigger`, only Ctrl+C and `Quit` escalate.
+- Unix: a shutdown signal that arrived during `install()` could be lost
+  (neither delivered nor acted on by its default action): the
+  conditional default action that restores the default after uninstall
+  was registered, switched off, before the delivering handler. It is now
+  armed after the delivering handler is registered, on first install
+  and on every re-install.
+
+### Documentation
+
+- The README stated exit status 143 for escalation on Windows; only
+  Ctrl+C (130) and Ctrl+Break (131) escalate there.
+- `SignalSet::graceful`, `CoordinatorBuilder::new`, `signals`,
+  `notify_signals` and `shutdown_signal` document the default set and
+  its two adjustments. The README reload example uses `SignalSet::stop()`.
+
 ## [2.1.1] - 2026-11-04
 
 Pre-1.0 review of the whole crate (security, edge cases, idle cost). No
@@ -529,7 +592,8 @@ SM2-015). Upgrade notes: `docs/MIGRATION.md`.
   `.dev/` planning structure (DIRECTIVES, ROADMAP, PROMPTS).
 - Crate name reserved on crates.io.
 
-[Unreleased]: https://github.com/jamesgober/signal-mod/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/jamesgober/signal-mod/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/jamesgober/signal-mod/compare/v2.1.1...v2.2.0
 [2.1.1]: https://github.com/jamesgober/signal-mod/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/jamesgober/signal-mod/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/jamesgober/signal-mod/compare/v1.0.0...v2.0.0

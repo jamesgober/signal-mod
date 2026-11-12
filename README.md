@@ -44,8 +44,14 @@ the standard library provides:
 ## What it does
 
 - **Signals:** SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGPIPE, SIGUSR1,
-  SIGUSR2 and `CTRL_C` / `CTRL_BREAK` / `CTRL_CLOSE` / `CTRL_LOGOFF` /
-  `CTRL_SHUTDOWN`, with numbers taken from the target's `libc`.
+  SIGUSR2 and `CTRL_C` / `CTRL_BREAK` / `CTRL_CLOSE` / `CTRL_SHUTDOWN`,
+  with numbers taken from the target's `libc`.
+- **Default shutdown set:** SIGTERM, SIGINT and SIGHUP
+  (`SignalSet::graceful()`). A signal given to `notify_signals` leaves
+  it, so a SIGHUP reload subscription does not stop the process, and on
+  Unix a default signal that was ignored at start-up (SIGHUP under
+  `nohup`) stays ignored. `SignalSet::stop()` is SIGTERM and SIGINT
+  only.
 - **Shutdown state:** cloneable tokens and triggers, runtime-agnostic
   `wait().await` (no polling), blocking waits, child scopes, subsystem
   guards with "wait until all workers stopped", `CancellationToken`
@@ -56,8 +62,10 @@ the standard library provides:
   `run_hooks_async` that never blocks the executor.
 - **Escalation:** opt-in "second Ctrl+C ends the process now" (the
   signal is re-raised on Unix, so shells see a real SIGINT death; exit
-  status 130 / 143 on Windows), and `ShutdownReason::exit_code()` for the
-  normal path.
+  status 130 (Ctrl+C) / 131 (Ctrl+Break) on Windows). Only a repeat of
+  the first signal escalates (or Ctrl+C and `Quit` after each other), not
+  a different signal sent with it. `ShutdownReason::exit_code()` covers
+  the normal path.
 - **Clean teardown:** dropping the coordinator removes its listeners.
   On Unix, shutdown signals that were at their default action before
   signal-mod get it back; signals that other code ignored or handled are
@@ -149,7 +157,7 @@ use signal_mod::{Coordinator, Signal, SignalSet};
 #[tokio::main]
 async fn main() -> signal_mod::Result<()> {
     let coord = Coordinator::builder()
-        .signals(SignalSet::graceful() - Signal::Hangup)
+        .signals(SignalSet::stop())
         .notify_signals(SignalSet::empty().with(Signal::Hangup).with(Signal::User1))
         .build();
     coord.install()?;
@@ -343,9 +351,11 @@ other builds:
 | Windows (x86_64)       | yes     | yes        | yes (`CTRL_BREAK`)      |
 | FreeBSD, NetBSD, i686  | yes     | yes        | compile and lint only   |
 
-On Windows, `Pipe`, `User1` and `User2` are never delivered,
-`CTRL_LOGOFF` / `CTRL_SHUTDOWN` reach services only, and the OS ends the
-process about 5 seconds after `CTRL_CLOSE`; see the
+On Windows, `Hangup`, `Pipe`, `User1` and `User2` are never delivered
+by the console, `CTRL_SHUTDOWN` (`Terminate`) reaches services only,
+`CTRL_LOGOFF` is declined so a service keeps running when a user logs
+off, and the OS ends the process about 5 seconds after `CTRL_CLOSE`; see
+the
 [platform notes](docs/API.md#platform-behavior).
 
 

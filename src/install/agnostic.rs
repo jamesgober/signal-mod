@@ -28,7 +28,7 @@ use crate::signal::SignalSet;
 pub(crate) struct Registration {
     stop: Stop,
     covered: SignalSet,
-    /// Signals counted by [`restore::acquire`](super::restore::acquire).
+    /// Signals counted by [`restore::arm`](super::restore::arm).
     #[cfg(unix)]
     restored: SignalSet,
 }
@@ -66,28 +66,36 @@ pub(crate) fn install(dispatcher: &Arc<Dispatcher>, set: SignalSet) -> Result<Re
     use crate::signal::Signal;
     use signal_hook::iterator::Signals;
 
-    // Read the prior dispositions before anything is registered.
-    let restored = super::restore::acquire(set, dispatcher.shutdown_set())
-        .map_err(|(sig, e)| super::registration_error(sig, e))?;
+    // `install::install` read the prior dispositions already. Creating the
+    // iterator only allocates its self-pipe; a failure is resource
+    // exhaustion, not a property of any one signal.
+    let mut signals = Signals::new(core::iter::empty::<i32>()).map_err(Error::ListenerThread)?;
+    for sig in set {
+        if let Some(number) = sig.unix_number() {
+            if let Err(e) = signals.add_signal(number) {
+                signals.handle().close();
+                return Err(super::registration_error(sig, e));
+            }
+        }
+    }
+    #[cfg(test)]
+    super::test_step("register");
+
+    // Only now that every signal has a delivering handler: a signal that
+    // lands in between is queued in the iterator, never lost.
+    let handle = signals.handle();
+    let restored = match super::restore::arm(set, dispatcher.shutdown_set()) {
+        Ok(restored) => restored,
+        Err((sig, e)) => {
+            handle.close();
+            return Err(super::registration_error(sig, e));
+        }
+    };
     let fail = |error: Error| {
         super::restore::release(restored);
         error
     };
 
-    // Creating the iterator only allocates its self-pipe; a failure is
-    // resource exhaustion, not a property of any one signal.
-    let mut signals =
-        Signals::new(core::iter::empty::<i32>()).map_err(|e| fail(Error::ListenerThread(e)))?;
-    for sig in set {
-        if let Some(number) = sig.unix_number() {
-            if let Err(e) = signals.add_signal(number) {
-                signals.handle().close();
-                return Err(fail(super::registration_error(sig, e)));
-            }
-        }
-    }
-
-    let handle = signals.handle();
     let listener = Arc::clone(dispatcher);
     let spawned = std::thread::Builder::new()
         .name("signal-mod-signals".into())
@@ -229,6 +237,35 @@ pub(crate) fn install(_dispatcher: &Arc<Dispatcher>, _set: SignalSet) -> Result<
         stop: Stop,
         covered: SignalSet::empty(),
     })
+}
+
+#[cfg(all(test, unix, not(loom)))]
+mod unix_tests {
+    use super::*;
+    use crate::signal::Signal;
+    use crate::state::Inner;
+    use crate::token::ShutdownTrigger;
+
+    // Review F-4: restoration was armed (a conditional default switched
+    // off) before the delivering handler was registered, so a signal in
+    // between ran only the switched-off action and was lost. The
+    // delivering handler must come first.
+    #[test]
+    fn test_delivering_handler_is_registered_before_restoration_is_armed() {
+        let inner = Inner::new();
+        let set = SignalSet::from(Signal::User2);
+        let dispatcher = Arc::new(Dispatcher::new(
+            ShutdownTrigger::new(crate::sync::Arc::clone(&inner)),
+            set,
+            false,
+        ));
+        super::super::TEST_STEPS.with(|steps| steps.borrow_mut().clear());
+        let reg = super::super::install(&dispatcher, set, SignalSet::empty())
+            .unwrap_or_else(|e| panic!("install failed: {e}"));
+        let steps = super::super::TEST_STEPS.with(|steps| steps.borrow().clone());
+        reg.uninstall();
+        assert_eq!(steps, vec!["register", "arm"]);
+    }
 }
 
 #[cfg(all(test, windows, not(feature = "tokio")))]

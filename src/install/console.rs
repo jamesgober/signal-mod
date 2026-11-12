@@ -11,13 +11,18 @@
 //! first one that returns `TRUE`. Routing every coordinator through this
 //! one handler is what lets all of them receive each event (one handler
 //! per coordinator would hide events from each other).
-//! It tells the five console events apart, and for `CTRL_CLOSE` /
-//! `CTRL_LOGOFF` / `CTRL_SHUTDOWN` it keeps the OS handler thread parked
-//! after delivering, because the OS terminates the process as soon as the
+//! It tells the console events apart, and for `CTRL_CLOSE` /
+//! `CTRL_SHUTDOWN` it keeps the OS handler thread parked after
+//! delivering, because the OS terminates the process as soon as the
 //! handler returns: parking gives the program the OS grace period (about
 //! 5 seconds) to shut down. When no installed coordinator covers an
 //! event, the handler declines it and the next handler (ultimately the
 //! OS default, terminate) runs.
+//!
+//! `CTRL_LOGOFF` is always declined. It reaches services only, whenever
+//! any user logs off, and the OS does not end a service for it; treating
+//! it as a signal stopped services at every logoff and left one parked
+//! OS thread behind each time.
 
 // The single FFI call into `SetConsoleCtrlHandler` below; it carries
 // a `SAFETY:` justification. Everything else in the crate stays safe.
@@ -28,8 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use windows_sys::Win32::System::Console::{
-    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
-    SetConsoleCtrlHandler,
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
 };
 use windows_sys::core::BOOL;
 
@@ -59,13 +63,13 @@ fn listeners() -> std::sync::MutexGuard<'static, Vec<Entry>> {
 }
 
 /// Map a console control event to its signal and whether the OS
-/// terminates the process when the handler returns.
+/// terminates the process when the handler returns. `None` (declined)
+/// for `CTRL_LOGOFF_EVENT` and unknown events.
 pub(super) const fn classify(ctrl: u32) -> Option<(Signal, bool)> {
     match ctrl {
         CTRL_C_EVENT => Some((Signal::Interrupt, false)),
         CTRL_BREAK_EVENT => Some((Signal::Quit, false)),
-        CTRL_CLOSE_EVENT => Some((Signal::Terminate, true)),
-        CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => Some((Signal::Hangup, true)),
+        CTRL_CLOSE_EVENT | CTRL_SHUTDOWN_EVENT => Some((Signal::Terminate, true)),
         _ => None,
     }
 }
@@ -145,15 +149,46 @@ extern "system" fn handler(ctrl: u32) -> BOOL {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Console::CTRL_LOGOFF_EVENT;
 
     #[test]
     fn test_classify_maps_every_console_event() {
         assert_eq!(classify(CTRL_C_EVENT), Some((Signal::Interrupt, false)));
         assert_eq!(classify(CTRL_BREAK_EVENT), Some((Signal::Quit, false)));
         assert_eq!(classify(CTRL_CLOSE_EVENT), Some((Signal::Terminate, true)));
-        assert_eq!(classify(CTRL_LOGOFF_EVENT), Some((Signal::Hangup, true)));
-        assert_eq!(classify(CTRL_SHUTDOWN_EVENT), Some((Signal::Hangup, true)));
+        assert_eq!(
+            classify(CTRL_SHUTDOWN_EVENT),
+            Some((Signal::Terminate, true))
+        );
+        assert_eq!(classify(CTRL_LOGOFF_EVENT), None);
         assert_eq!(classify(99), None);
+    }
+
+    // Review F-2: `CTRL_LOGOFF_EVENT` reaches services whenever any user
+    // logs off. It was delivered as `Hangup` (in the default shutdown
+    // set) and the handler thread then parked forever: the service
+    // stopped, and every logoff leaked one OS thread. It must be declined
+    // at once, even with a coordinator covering every signal.
+    #[test]
+    fn test_logoff_is_declined_without_parking_or_delivering() {
+        use crate::state::Inner;
+        use crate::token::ShutdownTrigger;
+
+        let inner = Inner::new();
+        let dispatcher = Arc::new(Dispatcher::new(
+            ShutdownTrigger::new(crate::sync::Arc::clone(&inner)),
+            SignalSet::all(),
+            false,
+        ));
+        let id = register(&dispatcher, SignalSet::all()).unwrap_or_else(|e| panic!("{e}"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _thread = std::thread::spawn(move || {
+            let _sent = tx.send(handler(CTRL_LOGOFF_EVENT));
+        });
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(5));
+        unregister(id);
+        assert_eq!(answer, Ok(FALSE), "logoff parked the handler thread");
+        assert!(!inner.is_initiated(), "logoff initiated shutdown");
     }
 
     #[test]

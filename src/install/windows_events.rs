@@ -9,12 +9,17 @@
 //! need no runtime: the Tokio back-end drives them from tasks, the
 //! agnostic back-end polls them from its listener thread. Tokio's handler
 //! also keeps the OS handler thread parked for `CTRL_CLOSE` /
-//! `CTRL_LOGOFF` / `CTRL_SHUTDOWN`, which gives the program the OS grace
-//! period (about 5 seconds) to shut down.
+//! `CTRL_SHUTDOWN`, which gives the program the OS grace period (about 5
+//! seconds) to shut down.
+//!
+//! No stream is ever created for `CTRL_LOGOFF`. It reaches services
+//! only, whenever any user logs off, and the OS does not end a service
+//! for it. With no listener, Tokio's handler declines the event (and
+//! does not park its thread), so the default handling applies.
 
 use core::task::{Context, Poll};
 
-use tokio::signal::windows::{CtrlBreak, CtrlC, CtrlClose, CtrlLogoff, CtrlShutdown};
+use tokio::signal::windows::{CtrlBreak, CtrlC, CtrlClose, CtrlShutdown};
 
 use crate::error::Result;
 use crate::signal::{Signal, SignalSet};
@@ -24,7 +29,6 @@ pub(crate) enum Stream {
     C(CtrlC),
     Break(CtrlBreak),
     Close(CtrlClose),
-    Logoff(CtrlLogoff),
     Shutdown(CtrlShutdown),
 }
 
@@ -34,7 +38,6 @@ impl Stream {
             Self::C(s) => s.poll_recv(cx),
             Self::Break(s) => s.poll_recv(cx),
             Self::Close(s) => s.poll_recv(cx),
-            Self::Logoff(s) => s.poll_recv(cx),
             Self::Shutdown(s) => s.poll_recv(cx),
         }
     }
@@ -68,16 +71,31 @@ pub(crate) fn streams(covered: SignalSet) -> Result<Vec<(Signal, Stream)>> {
             Signal::Terminate,
             Stream::Close(windows::ctrl_close().map_err(reg(Signal::Terminate))?),
         ));
-    }
-    if covered.contains(Signal::Hangup) {
         streams.push((
-            Signal::Hangup,
-            Stream::Logoff(windows::ctrl_logoff().map_err(reg(Signal::Hangup))?),
-        ));
-        streams.push((
-            Signal::Hangup,
-            Stream::Shutdown(windows::ctrl_shutdown().map_err(reg(Signal::Hangup))?),
+            Signal::Terminate,
+            Stream::Shutdown(windows::ctrl_shutdown().map_err(reg(Signal::Terminate))?),
         ));
     }
+    // `Hangup` has no Windows event: `CTRL_LOGOFF` is declined (see the
+    // module documentation) and `CTRL_SHUTDOWN` is `Terminate`.
     Ok(streams)
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    // Review F-2: `Hangup` used to register a `CTRL_LOGOFF` stream, so a
+    // service stopped (or reloaded) whenever any user logged off.
+    #[test]
+    fn test_no_stream_listens_for_logoff() {
+        let hangup = streams(SignalSet::from(Signal::Hangup)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(hangup.is_empty(), "Hangup registered a console stream");
+        let terminate: Vec<Signal> = streams(SignalSet::from(Signal::Terminate))
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .map(|(sig, _)| sig)
+            .collect();
+        assert_eq!(terminate, vec![Signal::Terminate, Signal::Terminate]);
+    }
 }
