@@ -72,6 +72,18 @@ fn scenarios() -> Vec<Scenario> {
             unix::expect_ok,
         ));
         v.push(("unix_notify_signal_is_not_restored", unix::expect_ok));
+        // Review F-1: the default set must leave a SIGHUP ignored by
+        // `nohup` alone.
+        v.push((
+            "unix_default_set_leaves_ignored_sighup_alone",
+            unix::expect_ok,
+        ));
+        // Review F-3: SIGTERM then SIGHUP (systemd `SendSIGHUP=yes`) is
+        // one stop, not a second request.
+        v.push((
+            "unix_sigterm_then_sighup_does_not_escalate",
+            unix::expect_ok,
+        ));
         // SM2-016: a process forked after `build()` still runs its hooks
         // within the budget.
         v.push(("unix_fork_after_build_runs_hooks", unix::expect_ok));
@@ -369,6 +381,14 @@ mod child {
             #[cfg(unix)]
             "unix_notify_signal_is_not_restored" => in_any_backend(unix_notify_not_restored),
             #[cfg(unix)]
+            "unix_default_set_leaves_ignored_sighup_alone" => {
+                in_any_backend(unix_default_set_skips_ignored);
+            }
+            #[cfg(unix)]
+            "unix_sigterm_then_sighup_does_not_escalate" => {
+                in_any_backend(unix_different_second_signal);
+            }
+            #[cfg(unix)]
             "unix_fork_after_build_runs_hooks" => unix_fork_after_build(),
             #[cfg(all(windows, feature = "tokio", feature = "agnostic"))]
             "windows_mixed_backends_both_receive" => windows_mixed_backends(),
@@ -558,6 +578,52 @@ mod child {
         drop(coord);
         raise(Signal::User2);
         std::thread::sleep(Duration::from_millis(200));
+        say("CHILD-OK");
+        std::process::exit(0);
+    }
+
+    /// Under `nohup` SIGHUP is ignored before `main`. The default shutdown
+    /// set must leave it that way (review F-1: the process shut down when
+    /// its terminal hung up).
+    #[cfg(unix)]
+    fn unix_default_set_skips_ignored() {
+        let number = Signal::Hangup
+            .unix_number()
+            .unwrap_or_else(|| fail("no number"));
+        // SAFETY: setting SIGHUP to SIG_IGN installs no handler code; the
+        // child is single-purpose and nothing else touches SIGHUP yet.
+        let previous = unsafe { libc::signal(number, libc::SIG_IGN) };
+        if previous == libc::SIG_ERR {
+            fail("could not ignore SIGHUP");
+        }
+        let coord = installed(Coordinator::builder());
+        if coord.installed_signals().contains(Signal::Hangup) {
+            fail("the ignored SIGHUP was installed");
+        }
+        raise(Signal::Hangup);
+        std::thread::sleep(Duration::from_millis(200));
+        if coord.token().is_initiated() {
+            fail("SIGHUP under nohup initiated shutdown");
+        }
+        raise(Signal::Terminate);
+        if !coord.token().wait_blocking_timeout(WAIT) {
+            fail("SIGTERM did not initiate shutdown");
+        }
+        say("CHILD-OK");
+        std::process::exit(0);
+    }
+
+    /// With escalation on, a different second signal must not end the
+    /// process (review F-3: the SIGHUP killed it before its hooks ran).
+    #[cfg(unix)]
+    fn unix_different_second_signal() {
+        let coord = installed(Coordinator::builder().force_exit_on_second_signal(true));
+        raise(Signal::Terminate);
+        if !coord.token().wait_blocking_timeout(WAIT) {
+            fail("SIGTERM did not initiate shutdown");
+        }
+        raise(Signal::Hangup);
+        std::thread::sleep(Duration::from_millis(300));
         say("CHILD-OK");
         std::process::exit(0);
     }

@@ -88,7 +88,7 @@ impl Dispatcher {
                 return;
             }
             let first = self.trigger.trigger(ShutdownReason::Signal(sig));
-            if !first && escalate_on_repeat {
+            if !first && escalate_on_repeat && is_repeat(self.trigger.token().reason(), sig) {
                 escalate(sig);
             }
         }));
@@ -143,16 +143,40 @@ impl Drop for Dispatcher {
 /// (`force_exit_on_second_signal`).
 ///
 /// On Windows only Ctrl+C and Ctrl+Break, the keys a person presses.
-/// `Terminate` (console close) and `Hangup` (logoff, system shutdown) are
-/// sent by the OS, which ends the process by itself after its grace
-/// period; ending it sooner only cuts the hooks short. A service also gets
-/// `SERVICE_CONTROL_SHUTDOWN` (`Terminate`) and `CTRL_SHUTDOWN_EVENT`
-/// (`Hangup`) for one machine shutdown: neither is a second request.
+/// `Terminate` (console close, system shutdown) is sent by the OS, which
+/// ends the process by itself after its grace period; ending it sooner
+/// only cuts the hooks short. A service also gets
+/// `SERVICE_CONTROL_SHUTDOWN` and `CTRL_SHUTDOWN_EVENT` (both `Terminate`)
+/// for one machine shutdown: neither is a second request.
+///
+/// Everywhere, the repeat must also be [`is_repeat`] of the signal that
+/// initiated the shutdown.
 const fn may_escalate(sig: Signal) -> bool {
     if cfg!(windows) {
         matches!(sig, Signal::Interrupt | Signal::Quit)
     } else {
         true
+    }
+}
+
+/// Whether `sig`, arriving after shutdown was initiated for `first`,
+/// repeats the request rather than adding a different one.
+///
+/// A repeat is the same signal again, or Ctrl+C (`Interrupt`) and
+/// `Quit` after each other: the keys a person presses to insist. Any
+/// other pair is not a repeat: systemd with `SendSIGHUP=yes` sends
+/// SIGTERM and then SIGHUP for one stop, and ending the process on the
+/// SIGHUP would skip every hook. A shutdown that was not initiated by a
+/// signal (a [`ShutdownTrigger`]) escalates on `Interrupt` or `Quit`
+/// only, so a supervisor's SIGTERM during a self-initiated shutdown does
+/// not cut the hooks short.
+fn is_repeat(first: Option<ShutdownReason>, sig: Signal) -> bool {
+    const fn is_key(sig: Signal) -> bool {
+        matches!(sig, Signal::Interrupt | Signal::Quit)
+    }
+    match first {
+        Some(ShutdownReason::Signal(first)) => first == sig || (is_key(first) && is_key(sig)),
+        _ => is_key(sig),
     }
 }
 
@@ -465,6 +489,58 @@ mod tests {
             inner.reason(),
             Some(ShutdownReason::Signal(Signal::Terminate))
         );
+    }
+
+    // Review F-3: on Unix any second shutdown signal escalated, so the
+    // SIGTERM-then-SIGHUP pair systemd sends with `SendSIGHUP=yes` killed
+    // the process (by SIGHUP) before its hooks ran. A regression ends the
+    // test process here.
+    #[test]
+    fn test_a_different_second_signal_does_not_escalate() {
+        let inner = Inner::new();
+        let trigger = ShutdownTrigger::new(Arc::clone(&inner));
+        let d = Dispatcher::new(trigger, SignalSet::all(), true);
+        d.deliver(Signal::Terminate);
+        d.deliver(Signal::Hangup);
+        d.deliver(Signal::User2);
+        assert_eq!(
+            inner.reason(),
+            Some(ShutdownReason::Signal(Signal::Terminate))
+        );
+    }
+
+    // Review F-3: a supervisor's SIGTERM during a shutdown the program
+    // started itself is not a person insisting.
+    #[test]
+    fn test_signal_after_programmatic_trigger_does_not_escalate_unless_a_key() {
+        let inner = Inner::new();
+        let trigger = ShutdownTrigger::new(Arc::clone(&inner));
+        assert!(trigger.trigger(ShutdownReason::Requested));
+        let d = Dispatcher::new(trigger, SignalSet::all(), true);
+        d.deliver(Signal::Terminate);
+        d.deliver(Signal::Hangup);
+        assert_eq!(inner.reason(), Some(ShutdownReason::Requested));
+    }
+
+    #[test]
+    fn test_is_repeat_accepts_same_signal_and_keyboard_pairs_only() {
+        let first = |s| Some(ShutdownReason::Signal(s));
+        assert!(is_repeat(first(Signal::Interrupt), Signal::Interrupt));
+        assert!(is_repeat(first(Signal::Terminate), Signal::Terminate));
+        assert!(is_repeat(first(Signal::Interrupt), Signal::Quit));
+        assert!(is_repeat(first(Signal::Quit), Signal::Interrupt));
+        assert!(!is_repeat(first(Signal::Terminate), Signal::Hangup));
+        assert!(!is_repeat(first(Signal::Terminate), Signal::Interrupt));
+        assert!(!is_repeat(first(Signal::Hangup), Signal::Terminate));
+        assert!(is_repeat(
+            Some(ShutdownReason::Requested),
+            Signal::Interrupt
+        ));
+        assert!(!is_repeat(
+            Some(ShutdownReason::Requested),
+            Signal::Terminate
+        ));
+        assert!(!is_repeat(None, Signal::Terminate));
     }
 
     #[test]

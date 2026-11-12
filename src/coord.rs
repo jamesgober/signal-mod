@@ -98,6 +98,9 @@ pub struct Coordinator {
     graceful_timeout: Duration,
     force_timeout: Duration,
     escalate: bool,
+    /// Shutdown signals that stay ignored when they were `SIG_IGN` before
+    /// install: the implicit default set only.
+    skip_if_ignored: SignalSet,
     installation: Mutex<Option<Registration>>,
 }
 
@@ -466,7 +469,11 @@ impl Coordinator {
         if installation.is_some() {
             return Err(Error::AlreadyInstalled);
         }
-        let registration = install::install(&self.dispatcher, self.signals | self.notify)?;
+        let registration = install::install(
+            &self.dispatcher,
+            self.signals | self.notify,
+            self.skip_if_ignored,
+        )?;
         *installation = Some(registration);
         // Service control codes reach this coordinator too, whatever
         // back-end it installed.
@@ -568,6 +575,8 @@ impl Drop for Coordinator {
 /// ```
 pub struct CoordinatorBuilder {
     signals: SignalSet,
+    /// `true` once [`signals`](Self::signals) was called.
+    signals_explicit: bool,
     notify: SignalSet,
     graceful_timeout: Duration,
     force_timeout: Duration,
@@ -579,6 +588,7 @@ impl fmt::Debug for CoordinatorBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CoordinatorBuilder")
             .field("signals", &self.signals)
+            .field("signals_explicit", &self.signals_explicit)
             .field("notify_signals", &self.notify)
             .field("graceful_timeout", &self.graceful_timeout)
             .field("force_timeout", &self.force_timeout)
@@ -591,7 +601,11 @@ impl fmt::Debug for CoordinatorBuilder {
 impl CoordinatorBuilder {
     /// Start a builder with the defaults:
     ///
-    /// - shutdown signals: [`SignalSet::graceful`]
+    /// - shutdown signals: [`SignalSet::graceful`] (`Terminate`,
+    ///   `Interrupt`, `Hangup`), minus any signal given to
+    ///   [`notify_signals`](Self::notify_signals); on Unix, a signal of
+    ///   this default set that was ignored before install (SIGHUP under
+    ///   `nohup`) stays ignored
     /// - notify signals: none
     /// - graceful budget: 5 seconds; force budget: 10 seconds
     /// - no second-signal escalation
@@ -600,6 +614,7 @@ impl CoordinatorBuilder {
     pub fn new() -> Self {
         Self {
             signals: SignalSet::graceful(),
+            signals_explicit: false,
             notify: SignalSet::empty(),
             graceful_timeout: DEFAULT_GRACEFUL,
             force_timeout: DEFAULT_FORCE,
@@ -609,16 +624,31 @@ impl CoordinatorBuilder {
     }
 
     /// Signals that initiate shutdown.
+    ///
+    /// Without this call the default set applies (see
+    /// [`new`](Self::new)). A set given here is used exactly as given:
+    /// signals in it are installed even if they were ignored before, and
+    /// a signal also given to [`notify_signals`](Self::notify_signals)
+    /// stays a shutdown signal. [`SignalSet::stop`] is the usual choice
+    /// for a service that reloads on SIGHUP.
     #[must_use]
     pub fn signals(mut self, set: SignalSet) -> Self {
         self.signals = set;
+        self.signals_explicit = true;
         self
     }
 
     /// Signals to deliver to [`Coordinator::subscribe`]rs **without**
     /// initiating shutdown: SIGHUP for "reload configuration", SIGUSR1
-    /// for "reopen log files", and so on. A signal in both sets
-    /// initiates shutdown and is delivered to subscribers.
+    /// for "reopen log files", and so on.
+    ///
+    /// These signals are taken out of the default shutdown set, so
+    /// `Coordinator::builder().notify_signals(SignalSet::from(Signal::Hangup))`
+    /// reloads on SIGHUP and stops on SIGTERM and SIGINT (since 2.2.0;
+    /// before, SIGHUP also stopped the process). A signal in both a
+    /// shutdown set given explicitly to [`signals`](Self::signals) and
+    /// this set initiates shutdown and is delivered to subscribers;
+    /// [`build`](Self::build) logs a warning for it (feature `tracing`).
     #[must_use]
     pub fn notify_signals(mut self, set: SignalSet) -> Self {
         self.notify = set;
@@ -656,6 +686,14 @@ impl CoordinatorBuilder {
     /// End the process immediately when a shutdown signal arrives after
     /// shutdown was already initiated: the "press Ctrl+C again to quit"
     /// convention. Off by default.
+    ///
+    /// Only a repeat escalates: the signal that initiated the shutdown
+    /// again, or Ctrl+C and `Quit` after each other. A different signal
+    /// does not (since 2.2.0): systemd with `SendSIGHUP=yes` sends SIGTERM
+    /// and then SIGHUP for one stop, and that pair used to end the process
+    /// before its hooks ran. After a shutdown started by a
+    /// [`ShutdownTrigger`](crate::ShutdownTrigger), only Ctrl+C and `Quit`
+    /// escalate.
     ///
     /// On Unix the signal's default action is re-raised, so the parent
     /// sees the process killed by that signal (what shells and
@@ -698,21 +736,33 @@ impl CoordinatorBuilder {
     /// install it, wait on its token, or run its hooks before forking.
     #[must_use]
     pub fn build(self) -> Coordinator {
+        let (signals, skip_if_ignored) = if self.signals_explicit {
+            let both = self.signals & self.notify;
+            if !both.is_empty() {
+                sm_warn!(signals = ?both,
+                    "signals in both the shutdown and the notify set initiate shutdown");
+            }
+            (self.signals, SignalSet::empty())
+        } else {
+            let signals = self.signals - self.notify;
+            (signals, signals)
+        };
         let inner = Inner::new();
         let trigger = ShutdownTrigger::new(sync::Arc::clone(&inner));
         Coordinator {
-            dispatcher: Arc::new(Dispatcher::new(trigger, self.signals, self.escalate)),
+            dispatcher: Arc::new(Dispatcher::new(trigger, signals, self.escalate)),
             runner: Arc::new(HookRunner::new(
                 self.hooks,
                 self.graceful_timeout,
                 self.force_timeout,
             )),
             inner,
-            signals: self.signals,
+            signals,
             notify: self.notify,
             graceful_timeout: self.graceful_timeout,
             force_timeout: self.force_timeout,
             escalate: self.escalate,
+            skip_if_ignored,
             installation: Mutex::new(None),
         }
     }
@@ -803,6 +853,37 @@ mod tests {
             CoordinatorBuilder::default().build().signals(),
             SignalSet::graceful()
         );
+    }
+
+    // Review F-1: a reload subscription to `Hangup` on the default builder
+    // left `Hangup` in the shutdown set, so the first reload request
+    // (`systemctl reload`, `kill -HUP`) stopped the process.
+    #[test]
+    fn test_notify_signal_leaves_the_default_shutdown_set() {
+        let c = Coordinator::builder()
+            .notify_signals(SignalSet::from(Signal::Hangup))
+            .build();
+        assert_eq!(c.signals(), SignalSet::graceful() - Signal::Hangup);
+        let mut sub = c.subscribe();
+        assert!(c.simulate_signal(Signal::Hangup));
+        assert_eq!(sub.try_recv(), Some(Signal::Hangup));
+        assert!(
+            !c.token().is_initiated(),
+            "reload request stopped the process"
+        );
+        assert!(c.simulate_signal(Signal::Terminate));
+        assert!(c.token().is_initiated());
+    }
+
+    #[test]
+    fn test_explicit_shutdown_set_keeps_an_overlap_with_notify() {
+        let c = Coordinator::builder()
+            .signals(SignalSet::graceful())
+            .notify_signals(SignalSet::from(Signal::Hangup))
+            .build();
+        assert_eq!(c.signals(), SignalSet::graceful());
+        assert!(c.simulate_signal(Signal::Hangup));
+        assert!(c.token().is_initiated());
     }
 
     #[test]

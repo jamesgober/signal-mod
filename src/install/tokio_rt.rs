@@ -27,7 +27,7 @@ use crate::signal::SignalSet;
 pub(crate) struct Registration {
     tasks: Vec<JoinHandle<()>>,
     covered: SignalSet,
-    /// Signals counted by [`restore::acquire`](super::restore::acquire).
+    /// Signals counted by [`restore::arm`](super::restore::arm).
     #[cfg(unix)]
     restored: SignalSet,
 }
@@ -56,9 +56,7 @@ pub(crate) fn install(
     use tokio::signal::unix::{SignalKind, signal};
 
     let _context = handle.enter();
-    // Read the prior dispositions before Tokio registers anything.
-    let restored = super::restore::acquire(set, dispatcher.shutdown_set())
-        .map_err(|(sig, e)| super::registration_error(sig, e))?;
+    // `install::install` read the prior dispositions already.
     let mut streams = Vec::with_capacity(set.len());
     for sig in set {
         let Some(number) = sig.unix_number() else {
@@ -74,12 +72,16 @@ pub(crate) fn install(
         });
         match created {
             Ok(stream) => streams.push((sig, stream)),
-            Err(e) => {
-                super::restore::release(restored);
-                return Err(super::registration_error(sig, e));
-            }
+            Err(e) => return Err(super::registration_error(sig, e)),
         }
     }
+    #[cfg(test)]
+    super::test_step("register");
+    // Only now that every signal has a delivering handler (Tokio queues a
+    // signal until its task polls the stream): one that lands in between
+    // is never lost.
+    let restored = super::restore::arm(set, dispatcher.shutdown_set())
+        .map_err(|(sig, e)| super::registration_error(sig, e))?;
 
     let tasks = streams
         .into_iter()

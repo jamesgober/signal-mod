@@ -110,7 +110,7 @@ pub enum Signal { Terminate, Interrupt, Quit, Hangup, Pipe, User1, User2 }
 | `Terminate` | SIGTERM  | `CTRL_CLOSE_EVENT`                         |
 | `Interrupt` | SIGINT   | `CTRL_C_EVENT`                             |
 | `Quit`      | SIGQUIT  | `CTRL_BREAK_EVENT`                         |
-| `Hangup`    | SIGHUP   | `CTRL_LOGOFF_EVENT`, `CTRL_SHUTDOWN_EVENT` |
+| `Hangup`    | SIGHUP   | never delivered (see below)                |
 | `Pipe`      | SIGPIPE  | never delivered                            |
 | `User1`     | SIGUSR1  | never delivered                            |
 | `User2`     | SIGUSR2  | never delivered                            |
@@ -159,6 +159,7 @@ A `Copy`, const-constructible bit set of signals with `|`, `&`, `-`
 | --------------------------------------- | --------------------------------------- |
 | `empty()`                               | no signals                              |
 | `graceful()`                            | `Terminate`, `Interrupt`, `Hangup`      |
+| `stop()`                                | `Terminate`, `Interrupt`                |
 | `standard()`                            | `graceful()` plus `Quit`                |
 | `all()`                                 | every variant (including `Pipe`)        |
 | `with(sig)` / `without(sig)`            | add / remove one signal                 |
@@ -919,8 +920,13 @@ is off), and a handler registered later by other code can hide events
 from signal-mod. Enable the `tokio` feature whenever the application
 uses `tokio::signal` itself.
 `Interrupt` is Ctrl+C, `Quit` Ctrl+Break, `Terminate` the
-console window closing, `Hangup` logoff or system shutdown (delivered to
-services only). After `CTRL_CLOSE_EVENT` the OS terminates the process
+console window closing or system shutdown (`CTRL_SHUTDOWN_EVENT`,
+delivered to services only). `Hangup` is never delivered on Windows.
+`CTRL_LOGOFF_EVENT` is declined: it reaches services whenever any user
+logs off, and the OS does not end a service for it, so the service keeps
+running (up to 2.1.1 it was `Hangup` and stopped a service built with
+the default set; `CTRL_SHUTDOWN_EVENT` was `Hangup` too). After
+`CTRL_CLOSE_EVENT` the OS terminates the process
 about 5 seconds later; both back-ends hold the OS handler thread so that
 window is usable, so keep `force_timeout` under it if console close
 matters. The console never delivers `Pipe`, `User1` or `User2`, so they

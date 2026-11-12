@@ -109,8 +109,30 @@ impl Registration {
 }
 
 /// Install listeners for `set`, routing deliveries to `dispatcher`.
+///
+/// On Unix, signals of `skip_if_ignored` that were ignored (`SIG_IGN`)
+/// before signal-mod first saw them are left out: the implicit default
+/// shutdown set honours `nohup` and a parent's ignored SIGINT.
 #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)] // shape shared by every feature combination
-pub(crate) fn install(dispatcher: &Arc<Dispatcher>, set: SignalSet) -> Result<Registration> {
+pub(crate) fn install(
+    dispatcher: &Arc<Dispatcher>,
+    set: SignalSet,
+    skip_if_ignored: SignalSet,
+) -> Result<Registration> {
+    #[cfg(all(unix, any(feature = "tokio", feature = "agnostic")))]
+    let set = {
+        // Read the prior dispositions before any back-end registers
+        // anything.
+        let skipped = restore::observe(set) & skip_if_ignored;
+        if !skipped.is_empty() {
+            sm_info!(signals = ?skipped,
+                "default shutdown signals that were ignored before install stay ignored");
+        }
+        set - skipped
+    };
+    #[cfg(not(all(unix, any(feature = "tokio", feature = "agnostic"))))]
+    let _ = skip_if_ignored; // nothing is ignored on this platform
+
     #[cfg(feature = "tokio")]
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return tokio_rt::install(&handle, dispatcher, set).map(Registration::Tokio);
@@ -132,6 +154,19 @@ pub(crate) fn install(dispatcher: &Arc<Dispatcher>, set: SignalSet) -> Result<Re
         let _ = (dispatcher, set); // no back-end compiled in
         Err(crate::error::Error::NoRuntime)
     }
+}
+
+/// Record an install step on the current thread, so tests can check the
+/// order in which a back-end registers its handlers and arms restoration.
+#[cfg(all(test, unix, any(feature = "tokio", feature = "agnostic")))]
+pub(crate) fn test_step(step: &'static str) {
+    TEST_STEPS.with(|steps| steps.borrow_mut().push(step));
+}
+
+#[cfg(all(test, unix, any(feature = "tokio", feature = "agnostic")))]
+thread_local! {
+    pub(crate) static TEST_STEPS: core::cell::RefCell<Vec<&'static str>> =
+        const { core::cell::RefCell::new(Vec::new()) };
 }
 
 /// Map a registration failure for `sig` into the crate error.

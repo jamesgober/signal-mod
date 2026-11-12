@@ -112,6 +112,43 @@ impl std::error::Error for Error {
     }
 }
 
+/// Lets `install()?` and `shutdown_signal()?` work in functions that
+/// return [`io::Result`], as server `main` functions usually do.
+///
+/// The [`io::ErrorKind`] is the OS error's kind for
+/// [`SignalRegistration`](Error::SignalRegistration) and
+/// [`ListenerThread`](Error::ListenerThread), `AlreadyExists` for
+/// [`AlreadyInstalled`](Error::AlreadyInstalled), and `Unsupported` for
+/// [`NoRuntime`](Error::NoRuntime) and
+/// [`OutsideTokioRuntime`](Error::OutsideTokioRuntime). The
+/// `signal_mod::Error` is kept as the inner error, so its message and
+/// [`source`](std::error::Error::source) chain stay available.
+///
+/// # Examples
+///
+/// ```
+/// fn run() -> std::io::Result<()> {
+///     let coord = signal_mod::Coordinator::builder().build();
+///     coord.install()?;
+///     coord.token().wait_blocking();
+///     Ok(())
+/// }
+/// ```
+impl From<Error> for io::Error {
+    #[allow(deprecated)] // must still map the deprecated variants
+    fn from(error: Error) -> Self {
+        let kind = match &error {
+            Error::SignalRegistration { source, .. } | Error::ListenerThread(source) => {
+                source.kind()
+            }
+            Error::AlreadyInstalled => io::ErrorKind::AlreadyExists,
+            Error::NoRuntime | Error::OutsideTokioRuntime => io::ErrorKind::Unsupported,
+            Error::InvalidState(_) | Error::Timeout(_) => io::ErrorKind::Other,
+        };
+        Self::new(kind, error)
+    }
+}
+
 /// Convenience alias for `Result<T, signal_mod::Error>`.
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -168,6 +205,51 @@ mod tests {
         assert!(Error::OutsideTokioRuntime.source().is_none());
         assert!(Error::InvalidState("x").source().is_none());
         assert!(Error::Timeout("x").source().is_none());
+    }
+
+    // Review F-5: `install()?` did not compile in an `io::Result` function.
+    #[test]
+    #[allow(clippy::unwrap_used)] // test assertions
+    fn test_error_converts_into_io_error_keeping_kind_and_source() {
+        fn run(error: Error) -> io::Result<()> {
+            Err(error)?;
+            Ok(())
+        }
+        let io = run(Error::SignalRegistration {
+            signal: Signal::Quit,
+            source: os_error(),
+        })
+        .unwrap_err();
+        assert_eq!(io.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            io.to_string()
+                .contains("failed to register handler for Quit")
+        );
+        let inner = io.get_ref().and_then(|e| e.downcast_ref::<Error>());
+        assert!(matches!(inner, Some(Error::SignalRegistration { .. })));
+        assert_eq!(
+            io.get_ref()
+                .and_then(|e| e.source())
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("denied by test")
+        );
+        assert_eq!(
+            run(Error::AlreadyInstalled).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            run(Error::NoRuntime).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            run(Error::OutsideTokioRuntime).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            run(Error::ListenerThread(os_error())).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
